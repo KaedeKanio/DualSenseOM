@@ -33,7 +33,7 @@ class SimpleOSCClient {
         if let addrData = address.data(using: .utf8) { data.append(addrData) }
         data.append(0)
         while data.count % 4 != 0 { data.append(0) }
-        data.append(contentsOf: [44, 102, 0, 0]) // ",f"
+        data.append(contentsOf: [44, 102, 0, 0])
         var bitPattern = value.bitPattern.bigEndian
         withUnsafeBytes(of: &bitPattern) { data.append(contentsOf: $0) }
         return data
@@ -51,6 +51,9 @@ class PS5Manager: ObservableObject {
     private var backgroundTimer: DispatchSourceTimer?
     
     init() {
+        // 終極魔法開關：強制允許在背景監聽硬體控制器事件！
+        GCController.shouldMonitorBackgroundEvents = true
+        
         // 阻擋 macOS 的 App Nap 休眠機制
         activity = ProcessInfo.processInfo.beginActivity(options: [.userInitiated, .latencyCritical], reason: "Keep OSC Background")
         
@@ -74,7 +77,6 @@ class PS5Manager: ObservableObject {
     }
     
     private func setupController(_ controller: GCController) {
-        // 藍牙終極解法：延遲 0.5 秒，等 macOS 把藍牙手把設定檔載入完成再抓取
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self, weak controller] in
             guard let self = self, let padController = controller else { return }
             guard padController.physicalInputProfile as? GCDualSenseGamepad != nil else { return }
@@ -138,52 +140,57 @@ class PS5Manager: ObservableObject {
     }
 }
 
-// MARK: - 3. 介面設計
+// MARK: - 3. 介面設計 (選單列專用面板)
 struct ContentView: View {
     @StateObject private var ps5Manager = PS5Manager()
     
     var body: some View {
-        VStack(spacing: 20) {
+        VStack(spacing: 12) {
             HStack {
                 Circle()
                     .fill(ps5Manager.isConnected ? Color.green : Color.red)
-                    .frame(width: 15, height: 15)
+                    .frame(width: 12, height: 12)
                 Text(ps5Manager.isConnected ? "PS5 手把已連線" : "等待手把連線...")
                     .font(.headline)
             }
-            .padding(.top, 20)
+            .padding(.top, 10)
             
-            VStack(alignment: .leading, spacing: 10) {
+            Divider()
+            
+            VStack(alignment: .leading, spacing: 8) {
                 Text("OSC Target")
-                    .font(.subheadline)
+                    .font(.caption)
                     .foregroundColor(.gray)
                 
                 HStack {
                     Text("IP:")
-                        .frame(width: 40, alignment: .leading)
+                        .frame(width: 30, alignment: .leading)
                     TextField("127.0.0.1", text: $ps5Manager.targetIP)
                         .textFieldStyle(RoundedBorderTextFieldStyle())
                 }
                 
                 HStack {
                     Text("Port:")
-                        .frame(width: 40, alignment: .leading)
+                        .frame(width: 30, alignment: .leading)
                     TextField("9999", text: $ps5Manager.targetPort)
                         .textFieldStyle(RoundedBorderTextFieldStyle())
                 }
             }
-            .padding()
-            .background(Color(NSColor.controlBackgroundColor))
-            .cornerRadius(10)
+            .padding(.horizontal, 10)
             
-            Spacer()
+            Divider()
             
-            Link("Designed by 羅苰榤", destination: URL(string: "https://github.com")!)
-                .font(.caption)
-                .foregroundColor(.blue)
-                .padding(.bottom, 10)
+            // 離開按鈕
+            Button(action: {
+                NSApplication.shared.terminate(nil)
+            }) {
+                Text("結束程式 (Quit)")
+                    .frame(maxWidth: .infinity)
+                    .foregroundColor(.red)
+            }
+            .padding(.horizontal, 10)
+            .padding(.bottom, 10)
         }
-        .padding()
-        .frame(width: 300, height: 260) // 恢復原本乾淨緊湊的視窗大小
+        .frame(width: 220) // 選單列下拉面板的寬度
     }
 }
