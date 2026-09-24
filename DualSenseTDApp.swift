@@ -2,11 +2,21 @@ import SwiftUI
 
 @main
 struct DualSenseTDApp: App {
+    // 把核心大腦放在最上層，讓選單列和設定視窗共用同一個實體
+    @StateObject private var manager = PS5Manager()
+
     var body: some Scene {
-        // MenuBarExtra 會讓 App 直接長在右上角的系統選單列
+        // 1. 右上角選單列
         MenuBarExtra("DualSenseTD", systemImage: "gamecontroller") {
-            ContentView()
+            ContentView(manager: manager)
         }
-        .menuBarExtraStyle(.window) // 點擊圖示會彈出我們寫好的操作面板
+        .menuBarExtraStyle(.window)
+        
+        // 2. 獨立的進階設定視窗
+        Window("進階設定 (DualSenseTD Settings)", id: "settings") {
+            SettingsView(manager: manager)
+        }
+        // 限制視窗不能亂拉大小，保持介面整潔
+        .windowResizability(.contentSize)
     }
 }
