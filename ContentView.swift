@@ -2,320 +2,751 @@ import SwiftUI
 import Combine
 import GameController
 import Network
+import AppKit
 
-// MARK: - 1. 原生 OSC 發送器
-class SimpleOSCClient {
+// MARK: - App entry
+
+@main
+struct DualSenseOSCApp: App {
+    @StateObject private var manager = PS5Manager()
+
+    var body: some Scene {
+        MenuBarExtra("DualSense OSC", systemImage: "gamecontroller.fill") {
+            MenuBarContent(manager: manager)
+        }
+        .menuBarExtraStyle(.window)
+
+        Settings {
+            SettingsView(manager: manager)
+        }
+    }
+}
+
+// MARK: - OSC over UDP
+
+/// 所有 NWConnection 狀態都由 queue 管理。
+/// 每次取樣的數值會放進同一個 OSC bundle 傳送。
+final class SimpleOSCClient {
+    private let queue = DispatchQueue(label: "tw.luojie.dualsense-osc.network")
     private var connection: NWConnection?
-    private var currentIP: String = ""
-    private var currentPort: UInt16 = 0
-    
-    func send(address: String, value: Float, to ip: String, port: UInt16) {
-        if connection == nil || currentIP != ip || currentPort != port {
-            connection?.cancel()
-            currentIP = ip
-            currentPort = port
-            if let nwPort = NWEndpoint.Port(rawValue: port) {
-                connection = NWConnection(to: .hostPort(host: NWEndpoint.Host(ip), port: nwPort), using: .udp)
-                connection?.start(queue: .global(qos: .userInteractive))
+    private var currentHost: String?
+    private var currentPort: UInt16?
+
+    var onStatusChange: ((String) -> Void)?
+
+    func configure(host: String, port: UInt16?) {
+        queue.async { [weak self] in
+            guard let self else { return }
+
+            guard let port,
+                  port > 0,
+                  !host.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                self.connection?.cancel()
+                self.connection = nil
+                self.currentHost = nil
+                self.currentPort = nil
+                self.report("請輸入有效的目標 IP 與 Port")
+                return
+            }
+
+            guard self.currentHost != host
+                    || self.currentPort != port
+                    || self.connection == nil else {
+                return
+            }
+
+            self.connection?.stateUpdateHandler = nil
+            self.connection?.cancel()
+
+            self.currentHost = host
+            self.currentPort = port
+            self.openConnection()
+        }
+    }
+
+    func send(addressPrefix: String, values: [String: Float]) {
+        guard !values.isEmpty else { return }
+
+        queue.async { [weak self] in
+            guard let self else { return }
+
+            if self.connection == nil {
+                self.openConnection()
+            }
+
+            guard let connection = self.connection else { return }
+
+            let packet = Self.encodeBundle(
+                prefix: addressPrefix,
+                values: values
+            )
+
+            connection.send(
+                content: packet,
+                completion: .contentProcessed { [weak self] error in
+                    if let error {
+                        self?.report("UDP 傳送錯誤：\(error.localizedDescription)")
+                    }
+                }
+            )
+        }
+    }
+
+    private func openConnection() {
+        guard let host = currentHost,
+              let port = currentPort,
+              let endpointPort = NWEndpoint.Port(rawValue: port) else {
+            return
+        }
+
+        let connection = NWConnection(
+            to: .hostPort(
+                host: NWEndpoint.Host(host),
+                port: endpointPort
+            ),
+            using: .udp
+        )
+
+        self.connection = connection
+
+        connection.stateUpdateHandler = { [weak self, weak connection] state in
+            guard let self else { return }
+
+            switch state {
+            case .ready:
+                self.report("UDP 已連線，可發送")
+
+            case .setup, .preparing:
+                self.report("正在連接 UDP…")
+
+            case .waiting(let error):
+                self.report("等待網路：\(error.localizedDescription)")
+
+            case .failed(let error):
+                self.report("UDP 錯誤：\(error.localizedDescription)")
+
+                if self.connection === connection {
+                    self.connection = nil
+                }
+
+            case .cancelled:
+                break
+
+            @unknown default:
+                self.report("UDP 狀態未知")
             }
         }
-        let data = encodeOSC(address: address, value: value)
-        connection?.send(content: data, completion: .idempotent)
+
+        connection.start(queue: queue)
     }
-    
-    private func encodeOSC(address: String, value: Float) -> Data {
+
+    private func report(_ message: String) {
+        DispatchQueue.main.async { [weak self] in
+            self?.onStatusChange?(message)
+        }
+    }
+
+    private static func encodeBundle(
+        prefix: String,
+        values: [String: Float]
+    ) -> Data {
+        var bundle = Data("#bundle\0".utf8)
+
+        // OSC immediate timetag
+        appendUInt64(1, to: &bundle)
+
+        for key in values.keys.sorted() {
+            guard let value = values[key] else { continue }
+
+            let message = encodeMessage(
+                address: "\(prefix)/\(key)",
+                value: value
+            )
+
+            appendUInt32(UInt32(message.count), to: &bundle)
+            bundle.append(message)
+        }
+
+        return bundle
+    }
+
+    private static func encodeMessage(
+        address: String,
+        value: Float
+    ) -> Data {
         var data = Data()
-        if let addrData = address.data(using: .utf8) { data.append(addrData) }
-        data.append(0)
-        while data.count % 4 != 0 { data.append(0) }
-        data.append(contentsOf: [44, 102, 0, 0])
-        var bitPattern = value.bitPattern.bigEndian
-        withUnsafeBytes(of: &bitPattern) { data.append(contentsOf: $0) }
+        appendOSCString(address, to: &data)
+        appendOSCString(",f", to: &data)
+        appendUInt32(value.bitPattern, to: &data)
         return data
     }
+
+    private static func appendOSCString(
+        _ string: String,
+        to data: inout Data
+    ) {
+        data.append(contentsOf: string.utf8)
+        data.append(0)
+
+        while data.count % 4 != 0 {
+            data.append(0)
+        }
+    }
+
+    private static func appendUInt32(
+        _ value: UInt32,
+        to data: inout Data
+    ) {
+        var bigEndian = value.bigEndian
+        withUnsafeBytes(of: &bigEndian) {
+            data.append(contentsOf: $0)
+        }
+    }
+
+    private static func appendUInt64(
+        _ value: UInt64,
+        to data: inout Data
+    ) {
+        var bigEndian = value.bigEndian
+        withUnsafeBytes(of: &bigEndian) {
+            data.append(contentsOf: $0)
+        }
+    }
 }
 
-// MARK: - 2. 核心大腦 (雙指觸控板修正版)
-class PS5Manager: ObservableObject {
+// MARK: - Controller and settings model
+
+@MainActor
+final class PS5Manager: ObservableObject {
     @Published var isConnected = false
-    @AppStorage("targetIP") var targetIP: String = "127.0.0.1"
-    @AppStorage("targetPort") var targetPort: String = "9999"
-    
-    @AppStorage("deadzoneL") var deadzoneL: Double = 0.05
-    @AppStorage("deadzoneR") var deadzoneR: Double = 0.05
-    @AppStorage("invertLX") var invertLX: Bool = false
-    @AppStorage("invertLY") var invertLY: Bool = false
-    @AppStorage("invertRX") var invertRX: Bool = false
-    @AppStorage("invertRY") var invertRY: Bool = false
-    
-    @AppStorage("invertAccelX") var invertAccelX: Bool = false
-    @AppStorage("invertAccelY") var invertAccelY: Bool = false
-    @AppStorage("invertAccelZ") var invertAccelZ: Bool = false
-    @AppStorage("invertGyroX") var invertGyroX: Bool = true
-    @AppStorage("invertGyroY") var invertGyroY: Bool = true
-    @AppStorage("invertGyroZ") var invertGyroZ: Bool = true
-    
+    @Published var controllerName = "等待控制器連線…"
+    @Published var networkStatus = "尚未設定目的地"
+    @Published private(set) var preview: [String: Float] = [:]
+    @Published private(set) var framesSent = 0
+
+    @Published var targetIP: String {
+        didSet {
+            save("targetIP", targetIP)
+            updateDestination()
+        }
+    }
+
+    @Published var targetPort: String {
+        didSet {
+            save("targetPort", targetPort)
+            updateDestination()
+        }
+    }
+
+    @Published var deadzoneL: Double {
+        didSet { save("deadzoneL", deadzoneL) }
+    }
+
+    @Published var deadzoneR: Double {
+        didSet { save("deadzoneR", deadzoneR) }
+    }
+
+    @Published var invertLX: Bool {
+        didSet { save("invertLX", invertLX) }
+    }
+
+    @Published var invertLY: Bool {
+        didSet { save("invertLY", invertLY) }
+    }
+
+    @Published var invertRX: Bool {
+        didSet { save("invertRX", invertRX) }
+    }
+
+    @Published var invertRY: Bool {
+        didSet { save("invertRY", invertRY) }
+    }
+
+    @Published var invertAccelX: Bool {
+        didSet { save("invertAccelX", invertAccelX) }
+    }
+
+    @Published var invertAccelY: Bool {
+        didSet { save("invertAccelY", invertAccelY) }
+    }
+
+    @Published var invertAccelZ: Bool {
+        didSet { save("invertAccelZ", invertAccelZ) }
+    }
+
+    @Published var invertGyroX: Bool {
+        didSet { save("invertGyroX", invertGyroX) }
+    }
+
+    @Published var invertGyroY: Bool {
+        didSet { save("invertGyroY", invertGyroY) }
+    }
+
+    @Published var invertGyroZ: Bool {
+        didSet { save("invertGyroZ", invertGyroZ) }
+    }
+
     private let oscClient = SimpleOSCClient()
-    private var activity: NSObjectProtocol?
-    private var backgroundTimer: DispatchSourceTimer?
-    private weak var activeController: GCController?
-    
-    init() {
+    private let addressPrefix = "/DualSenseTD"
+    private let defaults: UserDefaults
+
+    private var observers: [NSObjectProtocol] = []
+    private var sampleTimer: Timer?
+    private var activeController: GCController?
+
+    init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
+
+        targetIP = defaults.string(forKey: "targetIP") ?? "127.0.0.1"
+        targetPort = defaults.string(forKey: "targetPort") ?? "9999"
+
+        deadzoneL = defaults.object(forKey: "deadzoneL") as? Double ?? 0.05
+        deadzoneR = defaults.object(forKey: "deadzoneR") as? Double ?? 0.05
+
+        invertLX = defaults.object(forKey: "invertLX") as? Bool ?? false
+        invertLY = defaults.object(forKey: "invertLY") as? Bool ?? false
+        invertRX = defaults.object(forKey: "invertRX") as? Bool ?? false
+        invertRY = defaults.object(forKey: "invertRY") as? Bool ?? false
+
+        invertAccelX = defaults.object(forKey: "invertAccelX") as? Bool ?? false
+        invertAccelY = defaults.object(forKey: "invertAccelY") as? Bool ?? false
+        invertAccelZ = defaults.object(forKey: "invertAccelZ") as? Bool ?? false
+
+        invertGyroX = defaults.object(forKey: "invertGyroX") as? Bool ?? true
+        invertGyroY = defaults.object(forKey: "invertGyroY") as? Bool ?? true
+        invertGyroZ = defaults.object(forKey: "invertGyroZ") as? Bool ?? true
+
+        oscClient.onStatusChange = { [weak self] message in
+            Task { @MainActor in
+                self?.networkStatus = message
+            }
+        }
+
+        updateDestination()
         GCController.shouldMonitorBackgroundEvents = true
-        activity = ProcessInfo.processInfo.beginActivity(options: [.userInitiated, .latencyCritical], reason: "Keep OSC Background")
-        
-        NotificationCenter.default.addObserver(self, selector: #selector(didConnect), name: .GCControllerDidConnect, object: nil)
-        NotificationCenter.default.addObserver(self, selector: #selector(didDisconnect), name: .GCControllerDidDisconnect, object: nil)
-        
-        if let controller = GCController.controllers().first {
-            setupController(controller)
+
+        let center = NotificationCenter.default
+
+        observers.append(
+            center.addObserver(
+                forName: .GCControllerDidConnect,
+                object: nil,
+                queue: .main
+            ) { [weak self] _ in
+                Task { @MainActor in
+                    self?.selectAvailableController()
+                }
+            }
+        )
+
+        observers.append(
+            center.addObserver(
+                forName: .GCControllerDidDisconnect,
+                object: nil,
+                queue: .main
+            ) { [weak self] notification in
+                Task { @MainActor in
+                    self?.controllerDisconnected(
+                        notification.object as? GCController
+                    )
+                }
+            }
+        )
+
+        GCController.startWirelessControllerDiscovery(completionHandler: {})
+        selectAvailableController()
+    }
+
+    deinit {
+        sampleTimer?.invalidate()
+        observers.forEach {
+            NotificationCenter.default.removeObserver($0)
         }
     }
-    
-    @objc private func didConnect(_ notification: Notification) {
-        guard let controller = notification.object as? GCController else { return }
-        setupController(controller)
+
+    private func save(_ key: String, _ value: Any) {
+        defaults.set(value, forKey: key)
     }
-    
-    @objc private func didDisconnect(_ notification: Notification) {
-        DispatchQueue.main.async { self.isConnected = false }
+
+    private func updateDestination() {
+        let port = UInt16(
+            targetPort.trimmingCharacters(in: .whitespacesAndNewlines)
+        )
+
+        oscClient.configure(
+            host: targetIP.trimmingCharacters(in: .whitespacesAndNewlines),
+            port: port
+        )
+    }
+
+    private func selectAvailableController() {
+        guard let controller = GCController.controllers().first(where: {
+            $0.extendedGamepad is GCDualSenseGamepad
+        }) else {
+            activeController = nil
+            sampleTimer?.invalidate()
+            sampleTimer = nil
+            isConnected = false
+            controllerName = "等待 DualSense 連線…"
+            preview = ["connected": 0]
+
+            oscClient.send(
+                addressPrefix: addressPrefix,
+                values: ["status/connected": 0]
+            )
+            return
+        }
+
+        guard activeController !== controller else { return }
+
+        activeController = controller
+        isConnected = true
+        controllerName = controller.vendorName ?? "DualSense"
+        controller.motion?.sensorsActive = true
+
+        sampleTimer?.invalidate()
+        sampleTimer = Timer.scheduledTimer(
+            withTimeInterval: 1.0 / 60.0,
+            repeats: true
+        ) { [weak self] _ in
+            Task { @MainActor in
+                self?.sample()
+            }
+        }
+
+        sample()
+    }
+
+    private func controllerDisconnected(_ disconnected: GCController?) {
+        guard disconnected == nil || disconnected === activeController else {
+            return
+        }
+
+        if let remaining = GCController.controllers().first(where: {
+            $0.extendedGamepad is GCDualSenseGamepad
+        }) {
+            activeController = nil
+            selectSpecificController(remaining)
+        } else {
+            activeController = nil
+            sampleTimer?.invalidate()
+            sampleTimer = nil
+            isConnected = false
+            controllerName = "等待 DualSense 連線…"
+            preview = ["connected": 0]
+
+            oscClient.send(
+                addressPrefix: addressPrefix,
+                values: ["status/connected": 0]
+            )
+        }
+    }
+
+    private func selectSpecificController(_ controller: GCController) {
         activeController = nil
-        backgroundTimer?.cancel()
-        backgroundTimer = nil
-    }
-    
-    private func setupController(_ controller: GCController) {
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self, weak controller] in
-            guard let self = self, let padController = controller else { return }
-            guard padController.physicalInputProfile as? GCDualSenseGamepad != nil else { return }
-            
-            self.isConnected = true
-            self.activeController = padController
-            padController.motion?.sensorsActive = true
-            
-            self.backgroundTimer?.cancel()
-            self.backgroundTimer = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .userInteractive))
-            self.backgroundTimer?.schedule(deadline: .now(), repeating: 1.0 / 60.0)
-            self.backgroundTimer?.setEventHandler { [weak self, weak padController] in
-                guard let self = self, let pad = padController?.physicalInputProfile as? GCDualSenseGamepad else { return }
-                self.sendAllData(from: pad, motion: padController?.motion)
+
+        guard controller.extendedGamepad is GCDualSenseGamepad else {
+            return
+        }
+
+        activeController = controller
+        isConnected = true
+        controllerName = controller.vendorName ?? "DualSense"
+        controller.motion?.sensorsActive = true
+
+        sampleTimer?.invalidate()
+        sampleTimer = Timer.scheduledTimer(
+            withTimeInterval: 1.0 / 60.0,
+            repeats: true
+        ) { [weak self] _ in
+            Task { @MainActor in
+                self?.sample()
             }
-            self.backgroundTimer?.resume()
         }
+
+        sample()
     }
-    
-    private func processAxis(_ value: Float, deadzone: Double, invert: Bool) -> Float {
-        let dz = Float(deadzone)
-        var out: Float = 0.0
-        if abs(value) > dz {
-            let sign = value > 0 ? 1.0 : -1.0
-            out = ((abs(value) - dz) / (1.0 - dz)) * Float(sign)
+
+    private func applyDeadzone(
+        _ value: Float,
+        deadzone: Double,
+        inverted: Bool
+    ) -> Float {
+        let dz = Float(min(max(deadzone, 0), 0.95))
+        let magnitude = abs(value)
+
+        let adjusted: Float
+        if magnitude <= dz {
+            adjusted = 0
+        } else {
+            let sign: Float = value < 0 ? -1 : 1
+            adjusted = (magnitude - dz) / (1 - dz) * sign
         }
-        return invert ? -out : out
+
+        return inverted ? -adjusted : adjusted
     }
-    
-    private func sendAllData(from pad: GCDualSenseGamepad, motion: GCMotion?) {
-        guard let portInt = UInt16(self.targetPort) else { return }
-        let ip = self.targetIP
-        let c = self.oscClient
-        let prefix = "/DualSenceTD"
-        
-        // --- 1. 雙搖桿 ---
-        let lx = processAxis(pad.leftThumbstick.xAxis.value, deadzone: deadzoneL, invert: invertLX)
-        let ly = processAxis(pad.leftThumbstick.yAxis.value, deadzone: deadzoneL, invert: invertLY)
-        let rx = processAxis(pad.rightThumbstick.xAxis.value, deadzone: deadzoneR, invert: invertRX)
-        let ry = processAxis(pad.rightThumbstick.yAxis.value, deadzone: deadzoneR, invert: invertRY)
-        
-        c.send(address: "\(prefix)/stick/left/x", value: lx, to: ip, port: portInt)
-        c.send(address: "\(prefix)/stick/left/y", value: ly, to: ip, port: portInt)
-        c.send(address: "\(prefix)/stick/right/x", value: rx, to: ip, port: portInt)
-        c.send(address: "\(prefix)/stick/right/y", value: ry, to: ip, port: portInt)
-        
-        // --- 2. 扳機與按鍵 ---
-        c.send(address: "\(prefix)/trigger/L2", value: pad.leftTrigger.value, to: ip, port: portInt)
-        c.send(address: "\(prefix)/trigger/R2", value: pad.rightTrigger.value, to: ip, port: portInt)
-        c.send(address: "\(prefix)/button/L1", value: pad.leftShoulder.isPressed ? 1.0 : 0.0, to: ip, port: portInt)
-        c.send(address: "\(prefix)/button/R1", value: pad.rightShoulder.isPressed ? 1.0 : 0.0, to: ip, port: portInt)
-        
-        c.send(address: "\(prefix)/button/cross", value: pad.buttonA.isPressed ? 1.0 : 0.0, to: ip, port: portInt)
-        c.send(address: "\(prefix)/button/circle", value: pad.buttonB.isPressed ? 1.0 : 0.0, to: ip, port: portInt)
-        c.send(address: "\(prefix)/button/square", value: pad.buttonX.isPressed ? 1.0 : 0.0, to: ip, port: portInt)
-        c.send(address: "\(prefix)/button/triangle", value: pad.buttonY.isPressed ? 1.0 : 0.0, to: ip, port: portInt)
-        
-        c.send(address: "\(prefix)/dpad/up", value: pad.dpad.up.isPressed ? 1.0 : 0.0, to: ip, port: portInt)
-        c.send(address: "\(prefix)/dpad/down", value: pad.dpad.down.isPressed ? 1.0 : 0.0, to: ip, port: portInt)
-        c.send(address: "\(prefix)/dpad/left", value: pad.dpad.left.isPressed ? 1.0 : 0.0, to: ip, port: portInt)
-        c.send(address: "\(prefix)/dpad/right", value: pad.dpad.right.isPressed ? 1.0 : 0.0, to: ip, port: portInt)
-        
-        c.send(address: "\(prefix)/button/options", value: pad.buttonOptions?.isPressed == true ? 1.0 : 0.0, to: ip, port: portInt)
-        c.send(address: "\(prefix)/button/menu", value: pad.buttonMenu.isPressed ? 1.0 : 0.0, to: ip, port: portInt)
-        c.send(address: "\(prefix)/button/L3", value: pad.leftThumbstickButton?.isPressed == true ? 1.0 : 0.0, to: ip, port: portInt)
-        c.send(address: "\(prefix)/button/R3", value: pad.rightThumbstickButton?.isPressed == true ? 1.0 : 0.0, to: ip, port: portInt)
-        c.send(address: "\(prefix)/button/touchpad", value: pad.touchpadButton.isPressed ? 1.0 : 0.0, to: ip, port: portInt)
-        
-        // --- 3. 觸控板雙指座標解析 ---
-        let primary = pad.touchpadPrimary
-        let primaryActive: Float = (abs(primary.xAxis.value) > 0.001 || abs(primary.yAxis.value) > 0.001) ? 1.0 : 0.0
-        c.send(address: "\(prefix)/touchpad/primary/x", value: Float(primary.xAxis.value), to: ip, port: portInt)
-        c.send(address: "\(prefix)/touchpad/primary/y", value: Float(primary.yAxis.value), to: ip, port: portInt)
-        c.send(address: "\(prefix)/touchpad/primary/touching", value: primaryActive, to: ip, port: portInt)
-        
-        let secondary = pad.touchpadSecondary
-        let secondaryActive: Float = (abs(secondary.xAxis.value) > 0.001 || abs(secondary.yAxis.value) > 0.001) ? 1.0 : 0.0
-        c.send(address: "\(prefix)/touchpad/secondary/x", value: Float(secondary.xAxis.value), to: ip, port: portInt)
-        c.send(address: "\(prefix)/touchpad/secondary/y", value: Float(secondary.yAxis.value), to: ip, port: portInt)
-        c.send(address: "\(prefix)/touchpad/secondary/touching", value: secondaryActive, to: ip, port: portInt)
-        
-        // --- 4. 6軸體感 ---
-        if let m = motion {
-            let ax = Float(m.acceleration.x) * (invertAccelX ? -1.0 : 1.0)
-            let ay = Float(m.acceleration.y) * (invertAccelY ? -1.0 : 1.0)
-            let az = Float(m.acceleration.z) * (invertAccelZ ? -1.0 : 1.0)
-            
-            let gx = Float(m.rotationRate.x) * (invertGyroX ? -1.0 : 1.0)
-            let gy = Float(m.rotationRate.y) * (invertGyroY ? -1.0 : 1.0)
-            let gz = Float(m.rotationRate.z) * (invertGyroZ ? -1.0 : 1.0)
-            
-            c.send(address: "\(prefix)/motion/accel/x", value: ax, to: ip, port: portInt)
-            c.send(address: "\(prefix)/motion/accel/y", value: ay, to: ip, port: portInt)
-            c.send(address: "\(prefix)/motion/accel/z", value: az, to: ip, port: portInt)
-            
-            c.send(address: "\(prefix)/motion/gyro/x", value: gx, to: ip, port: portInt)
-            c.send(address: "\(prefix)/motion/gyro/y", value: gy, to: ip, port: portInt)
-            c.send(address: "\(prefix)/motion/gyro/z", value: gz, to: ip, port: portInt)
+
+    private func sample() {
+        guard let controller = activeController,
+              let pad = controller.extendedGamepad as? GCDualSenseGamepad else {
+            return
         }
+
+        var values: [String: Float] = [:]
+
+        func put(_ key: String, _ value: Float) {
+            values[key] = value
+        }
+
+        func pressed(_ key: String, _ input: GCControllerButtonInput?) {
+            if let input {
+                put(key, input.isPressed ? 1 : 0)
+            }
+        }
+
+        // Sticks
+        put(
+            "stick/left/x",
+            applyDeadzone(
+                pad.leftThumbstick.xAxis.value,
+                deadzone: deadzoneL,
+                inverted: invertLX
+            )
+        )
+        put(
+            "stick/left/y",
+            applyDeadzone(
+                pad.leftThumbstick.yAxis.value,
+                deadzone: deadzoneL,
+                inverted: invertLY
+            )
+        )
+        put(
+            "stick/right/x",
+            applyDeadzone(
+                pad.rightThumbstick.xAxis.value,
+                deadzone: deadzoneR,
+                inverted: invertRX
+            )
+        )
+        put(
+            "stick/right/y",
+            applyDeadzone(
+                pad.rightThumbstick.yAxis.value,
+                deadzone: deadzoneR,
+                inverted: invertRY
+            )
+        )
+
+        // Triggers and buttons
+        put("trigger/L2", pad.leftTrigger.value)
+        put("trigger/R2", pad.rightTrigger.value)
+
+        pressed("button/L1", pad.leftShoulder)
+        pressed("button/R1", pad.rightShoulder)
+
+        pressed("button/cross", pad.buttonA)
+        pressed("button/circle", pad.buttonB)
+        pressed("button/square", pad.buttonX)
+        pressed("button/triangle", pad.buttonY)
+
+        pressed("dpad/up", pad.dpad.up)
+        pressed("dpad/down", pad.dpad.down)
+        pressed("dpad/left", pad.dpad.left)
+        pressed("dpad/right", pad.dpad.right)
+
+        pressed("button/options", pad.buttonOptions)
+        pressed("button/menu", pad.buttonMenu)
+        pressed("button/L3", pad.leftThumbstickButton)
+        pressed("button/R3", pad.rightThumbstickButton)
+        pressed("button/touchpad", pad.touchpadButton)
+
+        // Touchpad coordinates
+        put("touchpad/primary/x", pad.touchpadPrimary.xAxis.value)
+        put("touchpad/primary/y", pad.touchpadPrimary.yAxis.value)
+        put("touchpad/secondary/x", pad.touchpadSecondary.xAxis.value)
+        put("touchpad/secondary/y", pad.touchpadSecondary.yAxis.value)
+
+        let surfaceTouching = controller.physicalInputProfile.allTouchpads.contains {
+            $0.touchState != .up
+        }
+        put("touchpad/touching", surfaceTouching ? 1 : 0)
+
+        // Motion
+        if let motion = controller.motion {
+            put(
+                "motion/accel/x",
+                Float(motion.acceleration.x) * (invertAccelX ? -1 : 1)
+            )
+            put(
+                "motion/accel/y",
+                Float(motion.acceleration.y) * (invertAccelY ? -1 : 1)
+            )
+            put(
+                "motion/accel/z",
+                Float(motion.acceleration.z) * (invertAccelZ ? -1 : 1)
+            )
+
+            put(
+                "motion/gyro/x",
+                Float(motion.rotationRate.x) * (invertGyroX ? -1 : 1)
+            )
+            put(
+                "motion/gyro/y",
+                Float(motion.rotationRate.y) * (invertGyroY ? -1 : 1)
+            )
+            put(
+                "motion/gyro/z",
+                Float(motion.rotationRate.z) * (invertGyroZ ? -1 : 1)
+            )
+        }
+
+        if let battery = controller.battery {
+            put("status/battery", battery.batteryLevel)
+        }
+
+        put("status/connected", 1)
+
+        preview = values
+        oscClient.send(addressPrefix: addressPrefix, values: values)
+        framesSent += 1
     }
 }
 
-// MARK: - 3. 選單列小視窗 (Menu Bar)
-struct ContentView: View {
+// MARK: - Menu bar interface
+
+struct MenuBarContent: View {
     @ObservedObject var manager: PS5Manager
-    @Environment(\.openWindow) private var openWindow
-    
+    @Environment(\.openSettings) private var openSettings
+
     var body: some View {
-        VStack(spacing: 12) {
-            HStack {
-                Circle()
-                    .fill(manager.isConnected ? Color.green : Color.red)
-                    .frame(width: 12, height: 12)
-                Text(manager.isConnected ? "PS5 手把已連線" : "等待手把連線...")
-                    .font(.headline)
-            }
-            .padding(.top, 10)
-            
+        VStack(alignment: .leading, spacing: 12) {
+            Label(
+                manager.isConnected
+                    ? manager.controllerName
+                    : "等待 DualSense 連線…",
+                systemImage: manager.isConnected
+                    ? "gamecontroller.fill"
+                    : "gamecontroller"
+            )
+            .foregroundStyle(
+                manager.isConnected ? Color.green : Color.secondary
+            )
+
+            Text("OSC：\(manager.targetIP):\(manager.targetPort)")
+                .font(.caption)
+
+            Text(manager.networkStatus)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            Text("每秒更新 60 次 · \(manager.framesSent) 幀")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+
+            Link(
+                "Designed by 羅苰榤",
+                destination: URL(
+                    string: "https://github.com/search?q=%E7%BE%85%E8%8B%B0%E6%A6%A4&type=users"
+                )!
+            )
+
             Divider()
-            
-            VStack(alignment: .leading, spacing: 6) {
-                Text("OSC 網路狀態").font(.caption).foregroundColor(.gray).bold()
-                HStack {
-                    Text("發送至 TD:")
-                    Spacer()
-                    Text("\(manager.targetIP):\(manager.targetPort)").foregroundColor(.blue)
-                }
+
+            Button("進階設定…") {
+                openSettings()
             }
-            .font(.system(size: 11))
-            .padding(.horizontal, 10)
-            
-            Divider()
-            
-            Button(action: {
-                openWindow(id: "settings")
-            }) {
-                HStack {
-                    Image(systemName: "slider.horizontal.3")
-                    Text("打開進階設定 (死區/反轉)")
-                }
-                .frame(maxWidth: .infinity)
-            }
-            .padding(.horizontal, 10)
-            
-            Divider()
-            
-            Button(action: {
+
+            Button("結束 DualSense OSC") {
                 NSApplication.shared.terminate(nil)
-            }) {
-                Text("結束程式 (Quit)")
-                    .frame(maxWidth: .infinity)
-                    .foregroundColor(.red)
             }
-            .padding(.horizontal, 10)
-            .padding(.bottom, 10)
         }
-        .frame(width: 240)
+        .padding(16)
+        .frame(width: 290)
     }
 }
 
-// MARK: - 4. 獨立進階設定視窗 (Settings Window)
+// MARK: - Settings window
+
 struct SettingsView: View {
     @ObservedObject var manager: PS5Manager
-    
+
     var body: some View {
         Form {
-            Section(header: Text("網路設定 (OSC Target)").font(.headline)) {
-                HStack {
-                    Text("TD IP:")
-                        .frame(width: 60, alignment: .leading)
-                    TextField("127.0.0.1", text: $manager.targetIP)
-                        .textFieldStyle(RoundedBorderTextFieldStyle())
-                }
-                HStack {
-                    Text("發送 Port:")
-                        .frame(width: 60, alignment: .leading)
-                    TextField("9999", text: $manager.targetPort)
-                        .textFieldStyle(RoundedBorderTextFieldStyle())
-                }
+            Section("OSC 目的地") {
+                TextField("Target IP / 主機名稱", text: $manager.targetIP)
+                TextField("UDP Port (1–65535)", text: $manager.targetPort)
+
+                Text(manager.networkStatus)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
-            Divider().padding(.vertical, 5)
-            
-            Section(header: Text("搖桿微調 (Sticks)").font(.headline)) {
-                VStack(alignment: .leading) {
-                    Text("左搖桿死區: \(manager.deadzoneL, specifier: "%.2f")")
-                    Slider(value: $manager.deadzoneL, in: 0...0.5)
-                    HStack {
-                        Toggle("反轉左 X", isOn: $manager.invertLX)
-                        Toggle("反轉左 Y", isOn: $manager.invertLY)
-                    }
-                }
-                .padding(.bottom, 10)
-                
-                VStack(alignment: .leading) {
-                    Text("右搖桿死區: \(manager.deadzoneR, specifier: "%.2f")")
-                    Slider(value: $manager.deadzoneR, in: 0...0.5)
-                    HStack {
-                        Toggle("反轉右 X", isOn: $manager.invertRX)
-                        Toggle("反轉右 Y", isOn: $manager.invertRY)
-                    }
-                }
+
+            Section("搖桿") {
+                deadzoneControl(
+                    "左搖桿死區",
+                    value: $manager.deadzoneL
+                )
+                Toggle("反轉左 X", isOn: $manager.invertLX)
+                Toggle("反轉左 Y", isOn: $manager.invertLY)
+
+                deadzoneControl(
+                    "右搖桿死區",
+                    value: $manager.deadzoneR
+                )
+                Toggle("反轉右 X", isOn: $manager.invertRX)
+                Toggle("反轉右 Y", isOn: $manager.invertRY)
             }
-            Divider().padding(.vertical, 5)
-            
-            Section(header: Text("體感反轉 (Motion Invert)").font(.headline)) {
-                HStack(alignment: .top) {
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text("加速度計 (Accel)").font(.subheadline).foregroundColor(.gray)
-                        Toggle("反轉 Accel X", isOn: $manager.invertAccelX)
-                        Toggle("反轉 Accel Y", isOn: $manager.invertAccelY)
-                        Toggle("反轉 Accel Z", isOn: $manager.invertAccelZ)
-                    }
-                    Spacer()
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text("陀螺儀 (Gyro)").font(.subheadline).foregroundColor(.gray)
-                        Toggle("反轉 Gyro X", isOn: $manager.invertGyroX)
-                        Toggle("反轉 Gyro Y", isOn: $manager.invertGyroY)
-                        Toggle("反轉 Gyro Z", isOn: $manager.invertGyroZ)
+
+            Section("體感軸向") {
+                Toggle("反轉加速度計 X", isOn: $manager.invertAccelX)
+                Toggle("反轉加速度計 Y", isOn: $manager.invertAccelY)
+                Toggle("反轉加速度計 Z", isOn: $manager.invertAccelZ)
+
+                Toggle("反轉陀螺儀 X", isOn: $manager.invertGyroX)
+                Toggle("反轉陀螺儀 Y", isOn: $manager.invertGyroY)
+                Toggle("反轉陀螺儀 Z", isOn: $manager.invertGyroZ)
+            }
+
+            Section("即時預覽") {
+                Text("已送出 \(manager.framesSent) 幀")
+
+                ForEach(manager.preview.keys.sorted(), id: \.self) { key in
+                    HStack {
+                        Text(key)
+                            .font(.caption)
+
+                        Spacer()
+
+                        Text(
+                            String(
+                                format: "%.3f",
+                                manager.preview[key] ?? 0
+                            )
+                        )
+                        .font(.system(.caption, design: .monospaced))
                     }
                 }
+
+                Text(
+                    "PS 鍵與麥克風靜音鍵未由此 GameController profile 穩定提供；觸控板提供整體觸摸狀態，座標分別提供主／次觸點。"
+                )
+                .font(.caption2)
+                .foregroundStyle(.secondary)
             }
         }
-        .padding(20)
-        .frame(width: 400, height: 450)
-        .onAppear {
-            for window in NSApplication.shared.windows {
-                if window.title == "進階設定 (DualSenseTD Settings)" {
-                    window.level = .floating
-                    window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
-                }
-            }
+        .formStyle(.grouped)
+        .padding(16)
+        .frame(minWidth: 420, minHeight: 650)
+    }
+
+    private func deadzoneControl(
+        _ title: String,
+        value: Binding<Double>
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("\(title)：\(value.wrappedValue, specifier: "%.2f")")
+            Slider(value: value, in: 0...0.5)
         }
     }
 }
