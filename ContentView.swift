@@ -10,15 +10,21 @@ struct ContentView: View {
             header
             controllerCard
             networkCard
-            HStack(spacing: 8) {
-                Label("OSC · 60 Hz", systemImage: "waveform.path")
-                Text("·").foregroundStyle(.tertiary)
-                Label("MIDI", systemImage: "pianokeys")
-                    .foregroundStyle(manager.midiEnabled && manager.midiAvailable ? Color.accentColor : Color.secondary)
-                Spacer(minLength: 4)
-                Text("取樣 \(manager.sampledFrames.formatted()) 次").monospacedDigit()
+            VStack(alignment: .leading, spacing: 5) {
+                HStack(spacing: 6) {
+                    Label("OSC · 60 Hz", systemImage: "waveform.path")
+                    Spacer(minLength: 4)
+                    Label(manager.midiStatus, systemImage: "pianokeys")
+                        .foregroundStyle(manager.midiEnabled && manager.midiAvailable ? Color.accentColor : Color.secondary)
+                        .lineLimit(1)
+                }
+                HStack {
+                    Text("MIDI 埠：\(manager.midiSourceName)")
+                    Spacer(minLength: 4)
+                    Text("取樣 \(manager.sampledFrames.formatted()) 次").monospacedDigit()
+                }
             }
-            .font(.caption2)
+            .font(.system(size: 9, weight: .medium))
             .foregroundStyle(.secondary)
 
             Button { openWindow(id: "settings") } label: {
@@ -68,7 +74,7 @@ struct ContentView: View {
                     .foregroundStyle(.secondary)
             }
             Spacer()
-            Text("v0.1.0")
+            Text("v0.1.1")
                 .font(.system(size: 10, weight: .medium, design: .monospaced))
                 .foregroundStyle(.secondary)
                 .padding(.horizontal, 8)
@@ -165,7 +171,7 @@ struct SettingsView: View {
                         Text("調整 OSC 輸出與控制器訊號").font(.caption).foregroundStyle(.secondary)
                     }
                     Spacer()
-                    Text("v0.1.0").font(.system(size: 10, weight: .medium, design: .monospaced)).foregroundStyle(.secondary)
+                    Text("v0.1.1").font(.system(size: 10, weight: .medium, design: .monospaced)).foregroundStyle(.secondary)
                 }
 
                 SettingsCard(title: "OSC 目的地", subtitle: "TouchDesigner 接收端", symbol: "dot.radiowaves.left.and.right") {
@@ -188,15 +194,37 @@ struct SettingsView: View {
                 SettingsCard(title: "MIDI 輸出", subtitle: "本機虛擬 MIDI 裝置", symbol: "pianokeys") {
                     Toggle("啟用 MIDI 輸出", isOn: $manager.midiEnabled)
                         .toggleStyle(.switch).controlSize(.small)
+                    Toggle("輸出加速度計／陀螺儀 MIDI", isOn: $manager.midiMotionEnabled)
+                        .toggleStyle(.switch).controlSize(.small)
+                        .disabled(!manager.midiEnabled)
+                    Text("預設關閉，避免 Arena 的 Shortcut Learn 被持續變動的體感訊號搶先捕捉。OSC 體感仍會照常輸出；關閉此項時，先前送出的體感軸會回到中心值。")
+                        .font(.caption2).foregroundStyle(.tertiary).fixedSize(horizontal: false, vertical: true)
                     Label(
-                        manager.midiAvailable ? "可用來源：\(manager.midiSourceName)" : "CoreMIDI 虛擬輸出建立失敗",
+                        manager.midiAvailable ? "\(manager.midiSourceName) · \(manager.midiStatus)" : "CoreMIDI 虛擬輸出 \(manager.midiStatus)",
                         systemImage: manager.midiAvailable ? "checkmark.circle.fill" : "exclamationmark.triangle.fill"
                     )
                     .font(.caption2).foregroundStyle(manager.midiAvailable ? Color.secondary : Color.orange)
-                    Text("在 TouchDesigner 的 MIDI In CHOP 選取此來源（Channel 1）。按鍵與觸控狀態統一使用 CC，按下／觸碰為 127，放開為 0。")
+                    Text("本次啟動已送出 \(manager.midiFramesSent.formatted()) 個完整控制器影格。")
+                        .font(.caption2).foregroundStyle(.tertiary).monospacedDigit()
+                    Text("TouchDesigner 請選「\(manager.midiSourceName)」（每影格完整狀態）；Arena 和 Ableton 請選「\(manager.midiLearnSourceName)」（只在數值改變時送出），避免 Shortcut Learn 一直被閒置 CC 觸發。兩個來源都由同一支手把控制。")
                         .font(.caption2).foregroundStyle(.tertiary).fixedSize(horizontal: false, vertical: true)
-                    Text("固定 CC 對照：16–19 搖桿、20–21 L2/R2、22–25 觸控座標、26–28 加速度、29–31 陀螺儀、32–48 按鍵與觸控狀態。TouchDesigner 開啟 1 Based Index 時，CHOP 的 ctr17 對應 MIDI CC16。每次取樣都送出完整狀態，讓所有通道維持穩定。")
+                    Label(
+                        "Learn 埠：\(manager.midiLearnStatus)",
+                        systemImage: manager.midiLearnAvailable ? "checkmark.circle.fill" : "exclamationmark.triangle.fill"
+                    )
+                    .font(.caption2).foregroundStyle(manager.midiLearnAvailable ? Color.secondary : Color.orange)
+                    Text("固定 CC 對照：16–19 搖桿、20–21 L2/R2、22–25 觸控座標、26–28 加速度、29–31 陀螺儀（體感 MIDI 開啟時輸出）、32–48 按鍵與觸控狀態。按鍵按下為 127、放開為 0；觸控座標放開歸零。每次取樣都送出目前啟用的完整狀態，避免未動的控制項消失。")
                         .font(.caption2).foregroundStyle(.tertiary).fixedSize(horizontal: false, vertical: true)
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("Arena：偏好設定 → MIDI，啟用 DualSenseOM MIDI Learn，再進入 MIDI Shortcuts 模式指派控制項。")
+                        Text("Ableton Live：Settings → Link, Tempo & MIDI，輸入選 DualSenseOM MIDI Learn；開啟 Track 接收，映射 Live 參數時開 Remote。")
+                    }
+                    .font(.caption2).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                    HStack(spacing: 12) {
+                        Link("Arena 指南", destination: URL(string: "https://resolume.com/support/en/midi-shortcuts")!)
+                        Link("Ableton MIDI 設定", destination: URL(string: "https://help.ableton.com/hc/en-us/articles/209774205-Live-s-MIDI-Settings")!)
+                    }
+                    .font(.caption2)
                 }
 
                 SettingsCard(title: "搖桿", subtitle: "圓形死區與軸向反轉", symbol: "circle.dotted") {

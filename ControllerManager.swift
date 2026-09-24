@@ -32,9 +32,34 @@ final class PS5Manager: ObservableObject {
             }
         }
     }
+    @Published var midiMotionEnabled: Bool {
+        didSet {
+            save("midiMotionEnabled", midiMotionEnabled)
+            if midiMotionEnabled {
+                midiOutput.resetMotionStateCache()
+            } else if midiEnabled {
+                midiOutput.sendMotionNeutral()
+            }
+        }
+    }
 
     var midiAvailable: Bool { midiOutput.isAvailable }
     var midiSourceName: String { midiOutput.sourceName }
+    var midiLearnAvailable: Bool { midiOutput.isLearnAvailable }
+    var midiLearnSourceName: String { midiOutput.learnSourceName }
+    var midiLearnStatus: String {
+        guard midiOutput.isLearnAvailable else {
+            return "建立失敗 · OSStatus \(midiOutput.learnInitializationError ?? -1)"
+        }
+        return "變更時傳送 · \(midiOutput.sentLearnUpdates.formatted()) 次"
+    }
+    var midiStatus: String {
+        guard midiEnabled else { return "已停用" }
+        guard midiOutput.isAvailable else { return "來源建立失敗 · OSStatus \(midiOutput.initializationError ?? -1)" }
+        guard isConnected else { return "等待手把" }
+        return midiOutput.lastSendSucceeded ? "來源正在送出" : "來源就緒，等待訊號"
+    }
+    var midiFramesSent: Int { midiOutput.sentFrames }
 
     @Published var targetIP: String { didSet { save("targetIP", targetIP); updateDestination() } }
     @Published var targetPort: String { didSet { save("targetPort", targetPort); updateDestination() } }
@@ -65,6 +90,7 @@ final class PS5Manager: ObservableObject {
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
         midiEnabled = defaults.object(forKey: "midiEnabled") as? Bool ?? true
+        midiMotionEnabled = defaults.object(forKey: "midiMotionEnabled") as? Bool ?? false
         targetIP = defaults.string(forKey: "targetIP") ?? "127.0.0.1"
         targetPort = defaults.string(forKey: "targetPort") ?? "9999"
         deadzoneL = defaults.object(forKey: "deadzoneL") as? Double ?? 0.05
@@ -252,7 +278,7 @@ final class PS5Manager: ObservableObject {
         }
         for (key, value) in current { pendingPreview[key] = value }
         oscClient.send(messages)
-        if midiEnabled { midiOutput.send(frame: current) }
+        if midiEnabled { midiOutput.send(frame: current, includeMotion: midiMotionEnabled) }
         totalSampledFrames += 1
     }
 
