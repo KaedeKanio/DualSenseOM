@@ -21,7 +21,7 @@ final class PS5Manager: ObservableObject {
     @Published private(set) var batteryLevel: Float?
     @Published var networkStatus = "尚未設定目的地"
     @Published private(set) var preview: [String: Float] = [:]
-    @Published private(set) var framesSent = 0
+    @Published private(set) var sampledFrames = 0
 
     @Published var targetIP: String { didSet { save("targetIP", targetIP); updateDestination() } }
     @Published var targetPort: String { didSet { save("targetPort", targetPort); updateDestination() } }
@@ -43,7 +43,10 @@ final class PS5Manager: ObservableObject {
     private var observers: [NSObjectProtocol] = []
     private var sampleTimer: Timer?
     private var statusTimer: Timer?
+    private var previewTimer: Timer?
     private var activeController: GCController?
+    private var pendingPreview: [String: Float] = [:]
+    private var totalSampledFrames = 0
 
     init(defaults: UserDefaults = .standard) {
         self.defaults = defaults
@@ -81,6 +84,7 @@ final class PS5Manager: ObservableObject {
     deinit {
         sampleTimer?.invalidate()
         statusTimer?.invalidate()
+        previewTimer?.invalidate()
         observers.forEach { NotificationCenter.default.removeObserver($0) }
     }
 
@@ -124,10 +128,13 @@ final class PS5Manager: ObservableObject {
         activeController?.motion?.sensorsActive = false
         activeController = nil
         stopTimers()
+        sendNeutralControlState()
         isConnected = false
         controllerName = "等待 DualSense 連線…"
         batteryLevel = nil
-        preview = ["s/connected": 0]
+        pendingPreview = ["s/connected": 0]
+        preview = pendingPreview
+        sampledFrames = totalSampledFrames
         oscClient.send([OSCMessage(address: "/ds/s/connected", value: 0)])
     }
 
@@ -137,15 +144,40 @@ final class PS5Manager: ObservableObject {
             Task { @MainActor [weak self] in self?.sample() }
         }
         statusTimer = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
-            Task { @MainActor [weak self] in self?.sendStatus() }
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.sendStatus()
+                self.sampledFrames = self.totalSampledFrames
+            }
+        }
+        previewTimer = Timer(timeInterval: 0.1, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.preview = self.pendingPreview
+            }
         }
         if let sampleTimer { RunLoop.main.add(sampleTimer, forMode: .common) }
         if let statusTimer { RunLoop.main.add(statusTimer, forMode: .common) }
+        if let previewTimer { RunLoop.main.add(previewTimer, forMode: .common) }
     }
 
     private func stopTimers() {
         sampleTimer?.invalidate(); sampleTimer = nil
         statusTimer?.invalidate(); statusTimer = nil
+        previewTimer?.invalidate(); previewTimer = nil
+    }
+
+    private func sendNeutralControlState() {
+        let paths = [
+            "lx", "ly", "rx", "ry", "l2", "r2", "l1", "r1",
+            "cross", "circle", "square", "triangle", "du", "dd", "dl", "dr",
+            "options", "menu", "l3", "r3", "tclick",
+            "t1/x", "t1/y", "t1/touch", "t2/x", "t2/y", "t2/touch",
+            "acc/x", "acc/y", "acc/z", "gyro/x", "gyro/y", "gyro/z"
+        ]
+        let neutral = paths.map { OSCMessage(address: "/ds/c/\($0)", value: 0) }
+        oscClient.send(neutral)
+        for path in paths { pendingPreview["c/\(path)"] = 0 }
     }
 
     private func sample() {
@@ -189,22 +221,22 @@ final class PS5Manager: ObservableObject {
             put("gyro/y", Float(motion.rotationRate.y) * (invertGyroY ? -1 : 1))
             put("gyro/z", Float(motion.rotationRate.z) * (invertGyroZ ? -1 : 1))
         }
-        for (key, value) in current { preview[key] = value }
+        for (key, value) in current { pendingPreview[key] = value }
         oscClient.send(messages)
-        framesSent += 1
+        totalSampledFrames += 1
     }
 
     private func sendStatus() {
         guard let controller = activeController else { return }
         var status = [OSCMessage(address: "/ds/s/connected", value: 1)]
-        preview["s/connected"] = 1
+        pendingPreview["s/connected"] = 1
         if let battery = controller.battery?.batteryLevel {
             batteryLevel = battery
             status.append(OSCMessage(address: "/ds/s/battery", value: battery))
-            preview["s/battery"] = battery
+            pendingPreview["s/battery"] = battery
         } else {
             batteryLevel = nil
-            preview.removeValue(forKey: "s/battery")
+            pendingPreview.removeValue(forKey: "s/battery")
         }
         oscClient.send(status)
     }
