@@ -1,195 +1,165 @@
 import SwiftUI
-import Combine
-import GameController
-import Network
+import AppKit
 
-// MARK: - 1. 原生 OSC 發送器
-class SimpleOSCClient {
-    private var connection: NWConnection?
-    private var currentIP: String = ""
-    private var currentPort: UInt16 = 0
-    
-    private func setupConnection(ip: String, port: UInt16) {
-        if connection != nil && currentIP == ip && currentPort == port { return }
-        connection?.cancel()
-        currentIP = ip
-        currentPort = port
-        
-        let host = NWEndpoint.Host(ip)
-        guard let nwPort = NWEndpoint.Port(rawValue: port) else { return }
-        
-        connection = NWConnection(to: .hostPort(host: host, port: nwPort), using: .udp)
-        connection?.start(queue: .global(qos: .userInteractive))
-    }
-    
-    func send(address: String, value: Float, to ip: String, port: UInt16) {
-        setupConnection(ip: ip, port: port)
-        let data = encodeOSC(address: address, value: value)
-        connection?.send(content: data, completion: .idempotent)
-    }
-    
-    private func encodeOSC(address: String, value: Float) -> Data {
-        var data = Data()
-        if let addrData = address.data(using: .utf8) { data.append(addrData) }
-        data.append(0)
-        while data.count % 4 != 0 { data.append(0) }
-        data.append(contentsOf: [44, 102, 0, 0]) // ",f"
-        var bitPattern = value.bitPattern.bigEndian
-        withUnsafeBytes(of: &bitPattern) { data.append(contentsOf: $0) }
-        return data
-    }
-}
 
-// MARK: - 2. 核心大腦：底層背景防護與全數據讀取
-class PS5Manager: ObservableObject {
-    @Published var isConnected = false
-    @AppStorage("targetIP") var targetIP: String = "127.0.0.1"
-    @AppStorage("targetPort") var targetPort: String = "9999"
-    
-    private let oscClient = SimpleOSCClient()
-    private var activity: NSObjectProtocol?
-    private var backgroundTimer: DispatchSourceTimer?
-    
-    init() {
-        // 阻擋 macOS 的 App Nap 休眠機制
-        activity = ProcessInfo.processInfo.beginActivity(options: [.userInitiated, .latencyCritical], reason: "Keep OSC Background")
-        
-        NotificationCenter.default.addObserver(self, selector: #selector(didConnect), name: .GCControllerDidConnect, object: nil)
-        NotificationCenter.default.addObserver(self, selector: #selector(didDisconnect), name: .GCControllerDidDisconnect, object: nil)
-        
-        if let controller = GCController.controllers().first {
-            setupController(controller)
-        }
-    }
-    
-    @objc private func didConnect(_ notification: Notification) {
-        guard let controller = notification.object as? GCController else { return }
-        setupController(controller)
-    }
-    
-    @objc private func didDisconnect(_ notification: Notification) {
-        DispatchQueue.main.async { self.isConnected = false }
-        backgroundTimer?.cancel()
-        backgroundTimer = nil
-    }
-    
-    private func setupController(_ controller: GCController) {
-        DispatchQueue.main.async { self.isConnected = true }
-        
-        // 喚醒手把的動態感測器
-        controller.motion?.sensorsActive = true
-        
-        // 建立獨立於 UI 之外的 GCD 背景執行緒計時器
-        backgroundTimer?.cancel()
-        backgroundTimer = DispatchSource.makeTimerSource(queue: DispatchQueue.global(qos: .userInteractive))
-        backgroundTimer?.schedule(deadline: .now(), repeating: 1.0 / 60.0)
-        backgroundTimer?.setEventHandler { [weak self, weak controller] in
-            guard let self = self,
-                  let pad = controller?.physicalInputProfile as? GCDualSenseGamepad else { return }
-            self.sendAllData(from: pad, motion: controller?.motion)
-        }
-        backgroundTimer?.resume()
-    }
-    
-    private func sendAllData(from pad: GCDualSenseGamepad, motion: GCMotion?) {
-        guard let portInt = UInt16(self.targetPort) else { return }
-        let ip = self.targetIP
-        let c = self.oscClient
-        
-        // 依照要求更改 Prefix
-        let prefix = "/DualSenceTD"
-        
-        // --- 1. 雙搖桿 ---
-        c.send(address: "\(prefix)/stick/left/x", value: pad.leftThumbstick.xAxis.value, to: ip, port: portInt)
-        c.send(address: "\(prefix)/stick/left/y", value: pad.leftThumbstick.yAxis.value, to: ip, port: portInt)
-        c.send(address: "\(prefix)/stick/right/x", value: pad.rightThumbstick.xAxis.value, to: ip, port: portInt)
-        c.send(address: "\(prefix)/stick/right/y", value: pad.rightThumbstick.yAxis.value, to: ip, port: portInt)
-        
-        // --- 2. 感壓板機與肩鍵 ---
-        c.send(address: "\(prefix)/trigger/L2", value: pad.leftTrigger.value, to: ip, port: portInt)
-        c.send(address: "\(prefix)/trigger/R2", value: pad.rightTrigger.value, to: ip, port: portInt)
-        c.send(address: "\(prefix)/button/L1", value: pad.leftShoulder.isPressed ? 1.0 : 0.0, to: ip, port: portInt)
-        c.send(address: "\(prefix)/button/R1", value: pad.rightShoulder.isPressed ? 1.0 : 0.0, to: ip, port: portInt)
-        
-        // --- 3. 動作按鍵 (圈叉角方) ---
-        c.send(address: "\(prefix)/button/cross", value: pad.buttonA.isPressed ? 1.0 : 0.0, to: ip, port: portInt)
-        c.send(address: "\(prefix)/button/circle", value: pad.buttonB.isPressed ? 1.0 : 0.0, to: ip, port: portInt)
-        c.send(address: "\(prefix)/button/square", value: pad.buttonX.isPressed ? 1.0 : 0.0, to: ip, port: portInt)
-        c.send(address: "\(prefix)/button/triangle", value: pad.buttonY.isPressed ? 1.0 : 0.0, to: ip, port: portInt)
-        
-        // --- 4. 方向鍵 (D-Pad) ---
-        c.send(address: "\(prefix)/dpad/up", value: pad.dpad.up.isPressed ? 1.0 : 0.0, to: ip, port: portInt)
-        c.send(address: "\(prefix)/dpad/down", value: pad.dpad.down.isPressed ? 1.0 : 0.0, to: ip, port: portInt)
-        c.send(address: "\(prefix)/dpad/left", value: pad.dpad.left.isPressed ? 1.0 : 0.0, to: ip, port: portInt)
-        c.send(address: "\(prefix)/dpad/right", value: pad.dpad.right.isPressed ? 1.0 : 0.0, to: ip, port: portInt)
-        
-        // --- 5. 系統按鍵與 L3/R3 ---
-        c.send(address: "\(prefix)/button/options", value: pad.buttonOptions?.isPressed == true ? 1.0 : 0.0, to: ip, port: portInt)
-        c.send(address: "\(prefix)/button/menu", value: pad.buttonMenu.isPressed ? 1.0 : 0.0, to: ip, port: portInt)
-        c.send(address: "\(prefix)/button/L3", value: pad.leftThumbstickButton?.isPressed == true ? 1.0 : 0.0, to: ip, port: portInt)
-        c.send(address: "\(prefix)/button/R3", value: pad.rightThumbstickButton?.isPressed == true ? 1.0 : 0.0, to: ip, port: portInt)
-        c.send(address: "\(prefix)/button/touchpad", value: pad.touchpadButton.isPressed ? 1.0 : 0.0, to: ip, port: portInt)
-        
-        // --- 6. 陀螺儀與加速度計 (Motion) ---
-        if let m = motion {
-            // 已修正：改用原始 acceleration 讀取包含重力的加速度
-            c.send(address: "\(prefix)/motion/accel/x", value: Float(m.acceleration.x), to: ip, port: portInt)
-            c.send(address: "\(prefix)/motion/accel/y", value: Float(m.acceleration.y), to: ip, port: portInt)
-            c.send(address: "\(prefix)/motion/accel/z", value: Float(m.acceleration.z), to: ip, port: portInt)
-            
-            c.send(address: "\(prefix)/motion/gyro/x", value: Float(m.rotationRate.x), to: ip, port: portInt)
-            c.send(address: "\(prefix)/motion/gyro/y", value: Float(m.rotationRate.y), to: ip, port: portInt)
-            c.send(address: "\(prefix)/motion/gyro/z", value: Float(m.rotationRate.z), to: ip, port: portInt)
-        }
-    }
-}
-
-// MARK: - 3. 介面設計
 struct ContentView: View {
-    @StateObject private var ps5Manager = PS5Manager()
-    
+    @ObservedObject var manager: PS5Manager
+    @Environment(\.openWindow) private var openWindow
+
     var body: some View {
-        VStack(spacing: 20) {
+        VStack(alignment: .leading, spacing: 12) {
             HStack {
-                Circle()
-                    .fill(ps5Manager.isConnected ? Color.green : Color.red)
-                    .frame(width: 15, height: 15)
-                Text(ps5Manager.isConnected ? "PS5 手把已連線" : "等待手把連線...")
-                    .font(.headline)
+                Label(
+                    manager.isConnected
+                        ? manager.controllerName
+                        : "等待 DualSense 連線…",
+                    systemImage: manager.isConnected
+                        ? "gamecontroller.fill"
+                        : "gamecontroller"
+                )
+                .foregroundStyle(
+                    manager.isConnected ? Color.green : Color.secondary
+                )
+                Spacer()
+                Label(batteryText, systemImage: batterySymbol)
+                    .foregroundStyle(.secondary)
+                    .help("手把電池電量")
             }
-            .padding(.top, 20)
-            
-            VStack(alignment: .leading, spacing: 10) {
-                Text("OSC Target")
-                    .font(.subheadline)
-                    .foregroundColor(.gray)
-                
-                HStack {
-                    Text("IP:")
-                        .frame(width: 40, alignment: .leading)
-                    TextField("127.0.0.1", text: $ps5Manager.targetIP)
-                        .textFieldStyle(RoundedBorderTextFieldStyle())
-                }
-                
-                HStack {
-                    Text("Port:")
-                        .frame(width: 40, alignment: .leading)
-                    TextField("9999", text: $ps5Manager.targetPort)
-                        .textFieldStyle(RoundedBorderTextFieldStyle())
-                }
-            }
-            .padding()
-            .background(Color(NSColor.controlBackgroundColor))
-            .cornerRadius(10)
-            
-            Spacer()
-            
-            Link("Designed by 羅苰榤", destination: URL(string: "https://github.com")!)
+
+            Text("OSC：\(manager.targetIP):\(manager.targetPort)")
                 .font(.caption)
-                .foregroundColor(.blue)
-                .padding(.bottom, 10)
+
+            Text(manager.networkStatus)
+                .font(.caption)
+                .foregroundStyle(
+                    manager.networkStatus.contains("拒絕")
+                        || manager.networkStatus.contains("找不到")
+                        || manager.networkStatus.contains("錯誤")
+                        ? Color.red
+                        : Color.secondary
+                )
+
+            Text("控制訊號最高 60 Hz · 已取樣 \(manager.framesSent) 次")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+
+            Link(
+                "Designed by NeoLo",
+                destination: URL(string: "https://github.com/KaedeKanio")!
+            )
+
+            Divider()
+
+            Button("進階設定…") {
+                openWindow(id: "settings")
+            }
+
+            Button("結束 DualSense OSC") {
+                NSApplication.shared.terminate(nil)
+            }
         }
-        .padding()
-        .frame(width: 300, height: 260)
+        .padding(16)
+        .frame(width: 330)
+    }
+
+    private var batteryText: String {
+        guard let batteryLevel = manager.batteryLevel else { return "--" }
+        return "\(Int((batteryLevel * 100).rounded()))%"
+    }
+
+    private var batterySymbol: String {
+        guard let batteryLevel = manager.batteryLevel else { return "battery.0percent" }
+        switch batteryLevel {
+        case ..<0.125: return "battery.0percent"
+        case ..<0.375: return "battery.25percent"
+        case ..<0.625: return "battery.50percent"
+        case ..<0.875: return "battery.75percent"
+        default: return "battery.100percent"
+        }
+    }
+}
+
+
+struct SettingsView: View {
+    @ObservedObject var manager: PS5Manager
+
+    var body: some View {
+        Form {
+            Section("OSC 目的地") {
+                TextField("Target IP / 主機名稱", text: $manager.targetIP)
+                TextField("UDP Port (1–65535)", text: $manager.targetPort)
+
+                Text(manager.networkStatus)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Section("搖桿") {
+                deadzoneControl(
+                    "左搖桿圓形死區",
+                    value: $manager.deadzoneL
+                )
+                Toggle("反轉左 X", isOn: $manager.invertLX)
+                Toggle("反轉左 Y", isOn: $manager.invertLY)
+
+                deadzoneControl(
+                    "右搖桿圓形死區",
+                    value: $manager.deadzoneR
+                )
+                Toggle("反轉右 X", isOn: $manager.invertRX)
+                Toggle("反轉右 Y", isOn: $manager.invertRY)
+            }
+
+            Section("體感軸向") {
+                Toggle("反轉加速度計 X", isOn: $manager.invertAccelX)
+                Toggle("反轉加速度計 Y", isOn: $manager.invertAccelY)
+                Toggle("反轉加速度計 Z", isOn: $manager.invertAccelZ)
+
+                Toggle("反轉陀螺儀 X", isOn: $manager.invertGyroX)
+                Toggle("反轉陀螺儀 Y", isOn: $manager.invertGyroY)
+                Toggle("反轉陀螺儀 Z", isOn: $manager.invertGyroZ)
+            }
+
+            Section("即時預覽") {
+                Text("已送出 \(manager.framesSent) 幀")
+
+                ForEach(manager.preview.keys.sorted(), id: \.self) { key in
+                    HStack {
+                        Text(key)
+                            .font(.caption)
+
+                        Spacer()
+
+                        Text(
+                            String(
+                                format: "%.3f",
+                                manager.preview[key] ?? 0
+                            )
+                        )
+                        .font(.system(.caption, design: .monospaced))
+                    }
+                }
+
+                Text(
+                    "PS 鍵與麥克風靜音鍵未由 GameController 穩定提供。控制訊號約 60 Hz；連線與電池狀態約 1 Hz。"
+                )
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+            }
+        }
+        .formStyle(.grouped)
+        .padding(16)
+        .frame(minWidth: 420, minHeight: 650)
+        .background(FloatingWindowConfigurator())
+    }
+
+    private func deadzoneControl(
+        _ title: String,
+        value: Binding<Double>
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            Text("\(title)：\(value.wrappedValue, specifier: "%.2f")")
+            Slider(value: value, in: 0...0.5)
+        }
     }
 }
