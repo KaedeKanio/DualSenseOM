@@ -9,10 +9,26 @@ import AppKit
 /// 所有 NWConnection 狀態都由 queue 管理。
 /// 每次取樣的數值會放進同一個 OSC bundle 傳送。
 final class SimpleOSCClient {
+    /// Bundle order is intentional so TouchDesigner channels appear consistently.
+    private static let oscKeyOrder = [
+        "stick/left/x", "stick/left/y", "stick/right/x", "stick/right/y",
+        "trigger/L2", "trigger/R2",
+        "button/L1", "button/R1", "button/cross", "button/circle",
+        "button/square", "button/triangle", "button/options", "button/menu",
+        "button/L3", "button/R3", "button/touchpad",
+        "dpad/up", "dpad/down", "dpad/left", "dpad/right",
+        "touchpad/primary/x", "touchpad/primary/y", "touchpad/primary/touching",
+        "touchpad/secondary/x", "touchpad/secondary/y", "touchpad/secondary/touching",
+        "motion/accel/x", "motion/accel/y", "motion/accel/z",
+        "motion/gyro/x", "motion/gyro/y", "motion/gyro/z",
+        "status/battery", "status/connected"
+    ]
+
     private let queue = DispatchQueue(label: "tw.luojie.dualsense-osc.network")
     private var connection: NWConnection?
     private var currentHost: String?
     private var currentPort: UInt16?
+    private var lastReportedSendError: String?
 
     var onStatusChange: ((String) -> Void)?
 
@@ -67,7 +83,7 @@ final class SimpleOSCClient {
                 content: packet,
                 completion: .contentProcessed { [weak self] error in
                     if let error {
-                        self?.report("UDP 傳送錯誤：\(error.localizedDescription)")
+                        self?.reportSendError(error)
                     }
                 }
             )
@@ -96,7 +112,8 @@ final class SimpleOSCClient {
 
             switch state {
             case .ready:
-                self.report("UDP 已連線，可發送")
+                self.lastReportedSendError = nil
+                self.report("UDP 已就緒；等待接收端")
 
             case .setup, .preparing:
                 self.report("正在連接 UDP…")
@@ -105,7 +122,7 @@ final class SimpleOSCClient {
                 self.report("等待網路：\(error.localizedDescription)")
 
             case .failed(let error):
-                self.report("UDP 錯誤：\(error.localizedDescription)")
+                self.reportSendError(error)
 
                 if self.connection === connection {
                     self.connection = nil
@@ -120,6 +137,22 @@ final class SimpleOSCClient {
         }
 
         connection.start(queue: queue)
+    }
+
+    private func reportSendError(_ error: NWError) {
+        let message: String
+        switch error {
+        case .posix(let code) where code == .ECONNREFUSED:
+            message = "接收端拒絕 UDP：請確認 TouchDesigner 的 OSC In 已啟用，且 Target IP / Port 相符。"
+        case .posix(let code) where code == .EHOSTUNREACH || code == .ENETUNREACH:
+            message = "找不到 UDP 接收端：請確認 Mac 與 Target IP 的網路連線。"
+        default:
+            message = "UDP 傳送錯誤：\(error.localizedDescription)"
+        }
+
+        guard lastReportedSendError != message else { return }
+        lastReportedSendError = message
+        report(message)
     }
 
     private func report(_ message: String) {
@@ -137,7 +170,11 @@ final class SimpleOSCClient {
         // OSC immediate timetag
         appendUInt64(1, to: &bundle)
 
-        for key in values.keys.sorted() {
+        let knownKeys = Set(Self.oscKeyOrder)
+        let orderedKeys = Self.oscKeyOrder.filter { values[$0] != nil }
+        let extraKeys = values.keys.filter { !knownKeys.contains($0) }.sorted()
+
+        for key in orderedKeys + extraKeys {
             guard let value = values[key] else { continue }
 
             let message = encodeMessage(
@@ -202,6 +239,7 @@ final class SimpleOSCClient {
 final class PS5Manager: ObservableObject {
     @Published var isConnected = false
     @Published var controllerName = "等待控制器連線…"
+    @Published private(set) var batteryLevel: Float?
     @Published var networkStatus = "尚未設定目的地"
     @Published private(set) var preview: [String: Float] = [:]
     @Published private(set) var framesSent = 0
@@ -368,7 +406,8 @@ final class PS5Manager: ObservableObject {
             sampleTimer = nil
             isConnected = false
             controllerName = "等待 DualSense 連線…"
-            preview = ["connected": 0]
+            batteryLevel = nil
+            preview = ["status/connected": 0]
 
             oscClient.send(
                 addressPrefix: addressPrefix,
@@ -413,7 +452,8 @@ final class PS5Manager: ObservableObject {
             sampleTimer = nil
             isConnected = false
             controllerName = "等待 DualSense 連線…"
-            preview = ["connected": 0]
+            batteryLevel = nil
+            preview = ["status/connected": 0]
 
             oscClient.send(
                 addressPrefix: addressPrefix,
@@ -547,10 +587,16 @@ final class PS5Manager: ObservableObject {
         put("touchpad/secondary/x", pad.touchpadSecondary.xAxis.value)
         put("touchpad/secondary/y", pad.touchpadSecondary.yAxis.value)
 
-        let surfaceTouching = controller.physicalInputProfile.allTouchpads.contains {
-            $0.touchState != .up
-        }
-        put("touchpad/touching", surfaceTouching ? 1 : 0)
+        // Match the original implementation: derive each binary flag from its
+        // corresponding DualSense touch coordinate pair.
+        let primaryX = pad.touchpadPrimary.xAxis.value
+        let primaryY = pad.touchpadPrimary.yAxis.value
+        let secondaryX = pad.touchpadSecondary.xAxis.value
+        let secondaryY = pad.touchpadSecondary.yAxis.value
+        let primaryTouching = abs(primaryX) > 0.001 || abs(primaryY) > 0.001
+        let secondaryTouching = abs(secondaryX) > 0.001 || abs(secondaryY) > 0.001
+        put("touchpad/primary/touching", primaryTouching ? 1 : 0)
+        put("touchpad/secondary/touching", secondaryTouching ? 1 : 0)
 
         // Motion
         if let motion = controller.motion {
@@ -581,6 +627,7 @@ final class PS5Manager: ObservableObject {
             )
         }
 
+        batteryLevel = controller.battery?.batteryLevel
         if let battery = controller.battery {
             put("status/battery", battery.batteryLevel)
         }
@@ -601,24 +648,36 @@ struct ContentView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Label(
-                manager.isConnected
-                    ? manager.controllerName
-                    : "等待 DualSense 連線…",
-                systemImage: manager.isConnected
-                    ? "gamecontroller.fill"
-                    : "gamecontroller"
-            )
-            .foregroundStyle(
-                manager.isConnected ? Color.green : Color.secondary
-            )
+            HStack {
+                Label(
+                    manager.isConnected
+                        ? manager.controllerName
+                        : "等待 DualSense 連線…",
+                    systemImage: manager.isConnected
+                        ? "gamecontroller.fill"
+                        : "gamecontroller"
+                )
+                .foregroundStyle(
+                    manager.isConnected ? Color.green : Color.secondary
+                )
+                Spacer()
+                Label(batteryText, systemImage: batterySymbol)
+                    .foregroundStyle(.secondary)
+                    .help("手把電池電量")
+            }
 
             Text("OSC：\(manager.targetIP):\(manager.targetPort)")
                 .font(.caption)
 
             Text(manager.networkStatus)
                 .font(.caption)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(
+                    manager.networkStatus.contains("拒絕")
+                        || manager.networkStatus.contains("找不到")
+                        || manager.networkStatus.contains("錯誤")
+                        ? Color.red
+                        : Color.secondary
+                )
 
             Text("每秒更新 60 次 · \(manager.framesSent) 幀")
                 .font(.caption2)
@@ -642,7 +701,23 @@ struct ContentView: View {
             }
         }
         .padding(16)
-        .frame(width: 290)
+        .frame(width: 330)
+    }
+
+    private var batteryText: String {
+        guard let batteryLevel = manager.batteryLevel else { return "--" }
+        return "\(Int((batteryLevel * 100).rounded()))%"
+    }
+
+    private var batterySymbol: String {
+        guard let batteryLevel = manager.batteryLevel else { return "battery.0percent" }
+        switch batteryLevel {
+        case ..<0.125: return "battery.0percent"
+        case ..<0.375: return "battery.25percent"
+        case ..<0.625: return "battery.50percent"
+        case ..<0.875: return "battery.75percent"
+        default: return "battery.100percent"
+        }
     }
 }
 
@@ -718,6 +793,7 @@ struct SettingsView: View {
         .formStyle(.grouped)
         .padding(16)
         .frame(minWidth: 420, minHeight: 650)
+        .background(FloatingWindowConfigurator())
     }
 
     private func deadzoneControl(
@@ -728,5 +804,29 @@ struct SettingsView: View {
             Text("\(title)：\(value.wrappedValue, specifier: "%.2f")")
             Slider(value: value, in: 0...0.5)
         }
+    }
+}
+
+
+// Keeps the advanced settings window above regular application windows.
+private struct FloatingWindowConfigurator: NSViewRepresentable {
+    func makeNSView(context: Context) -> NSView {
+        FloatingWindowLevelView()
+    }
+
+    func updateNSView(_ nsView: NSView, context: Context) {
+        (nsView as? FloatingWindowLevelView)?.applyFloatingLevel()
+    }
+}
+
+private final class FloatingWindowLevelView: NSView {
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        applyFloatingLevel()
+    }
+
+    func applyFloatingLevel() {
+        window?.level = .floating
+        window?.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
     }
 }
