@@ -35,7 +35,7 @@ class SimpleOSCClient {
     }
 }
 
-// MARK: - 2. 核心大腦 (極簡高效能版)
+// MARK: - 2. 核心大腦 (雙指觸控板修正版)
 class PS5Manager: ObservableObject {
     @Published var isConnected = false
     @AppStorage("targetIP") var targetIP: String = "127.0.0.1"
@@ -120,6 +120,7 @@ class PS5Manager: ObservableObject {
         let c = self.oscClient
         let prefix = "/DualSenceTD"
         
+        // --- 1. 雙搖桿 ---
         let lx = processAxis(pad.leftThumbstick.xAxis.value, deadzone: deadzoneL, invert: invertLX)
         let ly = processAxis(pad.leftThumbstick.yAxis.value, deadzone: deadzoneL, invert: invertLY)
         let rx = processAxis(pad.rightThumbstick.xAxis.value, deadzone: deadzoneR, invert: invertRX)
@@ -130,6 +131,7 @@ class PS5Manager: ObservableObject {
         c.send(address: "\(prefix)/stick/right/x", value: rx, to: ip, port: portInt)
         c.send(address: "\(prefix)/stick/right/y", value: ry, to: ip, port: portInt)
         
+        // --- 2. 扳機與按鍵 ---
         c.send(address: "\(prefix)/trigger/L2", value: pad.leftTrigger.value, to: ip, port: portInt)
         c.send(address: "\(prefix)/trigger/R2", value: pad.rightTrigger.value, to: ip, port: portInt)
         c.send(address: "\(prefix)/button/L1", value: pad.leftShoulder.isPressed ? 1.0 : 0.0, to: ip, port: portInt)
@@ -151,6 +153,20 @@ class PS5Manager: ObservableObject {
         c.send(address: "\(prefix)/button/R3", value: pad.rightThumbstickButton?.isPressed == true ? 1.0 : 0.0, to: ip, port: portInt)
         c.send(address: "\(prefix)/button/touchpad", value: pad.touchpadButton.isPressed ? 1.0 : 0.0, to: ip, port: portInt)
         
+        // --- 3. 觸控板雙指座標解析 ---
+        let primary = pad.touchpadPrimary
+        let primaryActive: Float = (abs(primary.xAxis.value) > 0.001 || abs(primary.yAxis.value) > 0.001) ? 1.0 : 0.0
+        c.send(address: "\(prefix)/touchpad/primary/x", value: Float(primary.xAxis.value), to: ip, port: portInt)
+        c.send(address: "\(prefix)/touchpad/primary/y", value: Float(primary.yAxis.value), to: ip, port: portInt)
+        c.send(address: "\(prefix)/touchpad/primary/touching", value: primaryActive, to: ip, port: portInt)
+        
+        let secondary = pad.touchpadSecondary
+        let secondaryActive: Float = (abs(secondary.xAxis.value) > 0.001 || abs(secondary.yAxis.value) > 0.001) ? 1.0 : 0.0
+        c.send(address: "\(prefix)/touchpad/secondary/x", value: Float(secondary.xAxis.value), to: ip, port: portInt)
+        c.send(address: "\(prefix)/touchpad/secondary/y", value: Float(secondary.yAxis.value), to: ip, port: portInt)
+        c.send(address: "\(prefix)/touchpad/secondary/touching", value: secondaryActive, to: ip, port: portInt)
+        
+        // --- 4. 6軸體感 ---
         if let m = motion {
             let ax = Float(m.acceleration.x) * (invertAccelX ? -1.0 : 1.0)
             let ay = Float(m.acceleration.y) * (invertAccelY ? -1.0 : 1.0)
