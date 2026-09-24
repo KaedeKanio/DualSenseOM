@@ -4,24 +4,6 @@ import GameController
 import Network
 import AppKit
 
-// MARK: - App entry
-
-@main
-struct DualSenseOSCApp: App {
-    @StateObject private var manager = PS5Manager()
-
-    var body: some Scene {
-        MenuBarExtra("DualSense OSC", systemImage: "gamecontroller.fill") {
-            MenuBarContent(manager: manager)
-        }
-        .menuBarExtraStyle(.window)
-
-        Settings {
-            SettingsView(manager: manager)
-        }
-    }
-}
-
 // MARK: - OSC over UDP
 
 /// 所有 NWConnection 狀態都由 queue 管理。
@@ -333,7 +315,7 @@ final class PS5Manager: ObservableObject {
                 object: nil,
                 queue: .main
             ) { [weak self] _ in
-                Task { @MainActor in
+                Task { @MainActor [weak self] in
                     self?.selectAvailableController()
                 }
             }
@@ -344,11 +326,9 @@ final class PS5Manager: ObservableObject {
                 forName: .GCControllerDidDisconnect,
                 object: nil,
                 queue: .main
-            ) { [weak self] notification in
-                Task { @MainActor in
-                    self?.controllerDisconnected(
-                        notification.object as? GCController
-                    )
+            ) { [weak self] _ in
+                Task { @MainActor [weak self] in
+                    self?.controllerDisconnected(nil)
                 }
             }
         )
@@ -409,7 +389,7 @@ final class PS5Manager: ObservableObject {
             withTimeInterval: 1.0 / 60.0,
             repeats: true
         ) { [weak self] _ in
-            Task { @MainActor in
+            Task { @MainActor [weak self] in
                 self?.sample()
             }
         }
@@ -459,7 +439,7 @@ final class PS5Manager: ObservableObject {
             withTimeInterval: 1.0 / 60.0,
             repeats: true
         ) { [weak self] _ in
-            Task { @MainActor in
+            Task { @MainActor [weak self] in
                 self?.sample()
             }
         }
@@ -615,9 +595,9 @@ final class PS5Manager: ObservableObject {
 
 // MARK: - Menu bar interface
 
-struct MenuBarContent: View {
+struct ContentView: View {
     @ObservedObject var manager: PS5Manager
-    @Environment(\.openSettings) private var openSettings
+    @Environment(\.openWindow) private var openWindow
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -654,7 +634,7 @@ struct MenuBarContent: View {
             Divider()
 
             Button("進階設定…") {
-                openSettings()
+                openWindow(id: "settings")
             }
 
             Button("結束 DualSense OSC") {
