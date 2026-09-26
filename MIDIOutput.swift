@@ -216,7 +216,7 @@ final class MIDIOutput {
         Int(channel) * 128 + Int(cc)
     }
 
-    private static func neutralValue(for cc: UInt8) -> UInt8 {
+    static func neutralValue(for cc: UInt8) -> UInt8 {
         switch cc {
         case 16...19, 26...31: return 64
         default: return 0

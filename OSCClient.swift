@@ -262,7 +262,7 @@ final class SimpleOSCReceiver {
         DispatchQueue.main.async { [weak self] in self?.onStatusChange?(message) }
     }
 
-    private static func decode(_ data: Data) -> [IncomingOSCMessage] {
+    static func decode(_ data: Data) -> [IncomingOSCMessage] {
         if data.starts(with: Data("#bundle\0".utf8)) {
             guard data.count >= 16 else { return [] }
             var result: [IncomingOSCMessage] = []

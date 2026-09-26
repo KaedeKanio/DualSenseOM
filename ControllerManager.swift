@@ -180,6 +180,8 @@ final class PS5Manager: ObservableObject {
     private let midiOutput = MIDIOutput()
     private let defaults: UserDefaults
     private var hidIdentityByController: [ObjectIdentifier: String] = [:]
+    private var lastHIDMappingDiagnostic: String?
+    private var triggerDiagnosticStates: [String: String] = [:]
     private var hidMappingRetryTimer: Timer?
     private var hidMappingRetryAttempt = 0
     private var observers: [NSObjectProtocol] = []
@@ -589,6 +591,10 @@ final class PS5Manager: ObservableObject {
             for side in ["l2", "r2"] {
                 let trigger = side == "l2" ? gamepad.leftTrigger : gamepad.rightTrigger
                 let configured = adaptiveTriggerSettings(for: slot, side: side)
+                let key = "\(slot).\(side)"
+                let signature = "\(configured.mode):\(trigger.mode.rawValue):\(trigger.status.rawValue)"
+                guard triggerDiagnosticStates[key] != signature else { continue }
+                triggerDiagnosticStates[key] = signature
                 print("[DualSenseOM TriggerDiag] event=\(reason) appActive=\(active) slot=\(slot) side=\(side) configuredMode=\(configured.mode) reportedMode=\(trigger.mode.rawValue) status=\(trigger.status.rawValue) arm=\(String(format: "%.3f", trigger.armPosition))")
             }
         }
@@ -857,6 +863,7 @@ final class PS5Manager: ObservableObject {
 
     private func configureHaptics(for controller: GCController, slot: Int) {
         stopHapticStreams(slot: slot)
+        triggerDiagnosticStates = triggerDiagnosticStates.filter { !$0.key.hasPrefix("\(slot).") }
         hapticEngines[slot]?.stop(completionHandler: nil)
         hapticEngines.removeValue(forKey: slot)
         hapticPlayers.removeValue(forKey: slot)
@@ -947,7 +954,7 @@ final class PS5Manager: ObservableObject {
         let connectedIDs = DualSenseHIDTriggerWriter.shared.connectedDeviceIdentities()
         guard !connectedIDs.isEmpty else {
             hidTriggerStatus = discovered.isEmpty ? "等待手把" : "等待 HID 裝置"
-            print("[DualSenseOM HIDTrigger] mapping pending: no physical HID device found")
+            reportHIDMappingDiagnostic("mapping pending: no physical HID device found")
             if discovered.isEmpty { cancelHIDMappingRetry() }
             else { scheduleHIDMappingRetry() }
             return
@@ -967,9 +974,9 @@ final class PS5Manager: ObservableObject {
             let identity = unpairedHIDIDs[0]
             hidIdentityByController[ObjectIdentifier(controller)] = identity
             let slot = controllersBySlot.first(where: { $0.value === controller })?.key ?? 0
-            print("[DualSenseOM HIDTrigger] mapped slot=\(slot) HID device=…\(identity.suffix(4))")
+            reportHIDMappingDiagnostic("mapped slot=\(slot) HID device=…\(identity.suffix(4))")
         } else if !unpairedControllers.isEmpty || !unpairedHIDIDs.isEmpty {
-            print("[DualSenseOM HIDTrigger] mapping pending: \(unpairedControllers.count) unpaired GameController(s), \(unpairedHIDIDs.count) unpaired HID device(s); connect controllers one at a time")
+            reportHIDMappingDiagnostic("mapping pending: \(unpairedControllers.count) unpaired GameController(s), \(unpairedHIDIDs.count) unpaired HID device(s); connect controllers one at a time")
         }
 
         if discovered.isEmpty {
@@ -985,6 +992,12 @@ final class PS5Manager: ObservableObject {
             hidTriggerStatus = "HID 配對中 · \(hidIdentityByController.count)/\(discovered.count)"
             scheduleHIDMappingRetry()
         }
+    }
+
+    private func reportHIDMappingDiagnostic(_ message: String) {
+        guard lastHIDMappingDiagnostic != message else { return }
+        lastHIDMappingDiagnostic = message
+        print("[DualSenseOM HIDTrigger] \(message)")
     }
 
     /// USB and Bluetooth HID devices can appear after GameController posts its
@@ -1303,7 +1316,7 @@ final class DualSenseHIDTriggerWriter {
         return String(registryID, radix: 16)
     }
 
-    private func makeReport(transport: String, settingsBySide: [String: AdaptiveTriggerSettings]) -> [UInt8] {
+    func makeReport(transport: String, settingsBySide: [String: AdaptiveTriggerSettings]) -> [UInt8] {
         let isBluetooth = transport == "bluetooth"
         var report = [UInt8](repeating: 0, count: isBluetooth ? 78 : 63)
         report[0] = isBluetooth ? 0x31 : 0x02
@@ -1415,7 +1428,7 @@ final class DualSenseHIDTriggerWriter {
         return bytes
     }
 
-    private func bluetoothCRC(report: [UInt8]) -> UInt32 {
+    func bluetoothCRC(report: [UInt8]) -> UInt32 {
         var crc: UInt32 = 0xFFFF_FFFF
         func update(_ byte: UInt8, crc: inout UInt32) {
             crc ^= UInt32(byte)
