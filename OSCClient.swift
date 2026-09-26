@@ -168,3 +168,149 @@ final class SimpleOSCClient {
         withUnsafeBytes(of: &bigEndian) { data.append(contentsOf: $0) }
     }
 }
+
+struct IncomingOSCMessage {
+    let address: String
+    let values: [Float]
+    let strings: [String]
+}
+
+/// Receives OSC over UDP and decodes float/int arguments and bundles.
+final class SimpleOSCReceiver {
+    private let queue = DispatchQueue(label: "tw.luojie.dualsense-osc.receive")
+    private var listener: NWListener?
+    private var connections: [ObjectIdentifier: NWConnection] = [:]
+    private var currentPort: UInt16?
+    var onMessages: (([IncomingOSCMessage]) -> Void)?
+    var onStatusChange: ((String) -> Void)?
+
+    func configure(port: UInt16?) {
+        queue.async { [weak self] in
+            guard let self else { return }
+            guard let port, port > 0, let endpointPort = NWEndpoint.Port(rawValue: port) else {
+                self.listener?.cancel()
+                self.listener = nil
+                self.connections.values.forEach { $0.cancel() }
+                self.connections.removeAll()
+                self.currentPort = nil
+                self.report("請輸入有效的 OSC 接收埠")
+                return
+            }
+            guard self.currentPort != port || self.listener == nil else { return }
+            self.listener?.cancel()
+            self.connections.values.forEach { $0.cancel() }
+            self.connections.removeAll()
+            self.currentPort = port
+            do {
+                let listener = try NWListener(using: .udp, on: endpointPort)
+                self.listener = listener
+                listener.stateUpdateHandler = { [weak self] state in
+                    switch state {
+                    case .ready: self?.report("OSC 接收中 · UDP \(port)")
+                    case .failed(let error): self?.report("OSC 接收失敗：\(error.localizedDescription)")
+                    case .waiting(let error): self?.report("OSC 接收等待網路：\(error.localizedDescription)")
+                    case .cancelled: break
+                    default: break
+                    }
+                }
+                listener.newConnectionHandler = { [weak self] connection in
+                    self?.accept(connection)
+                }
+                listener.start(queue: queue)
+            } catch {
+                self.listener = nil
+                self.currentPort = nil
+                self.report("無法開啟 OSC 接收埠：\(error.localizedDescription)")
+            }
+        }
+    }
+
+    private func accept(_ connection: NWConnection) {
+        let key = ObjectIdentifier(connection)
+        connections[key] = connection
+        connection.stateUpdateHandler = { [weak self, weak connection] state in
+            guard let self else { return }
+            if case .failed = state, let connection {
+                self.connections.removeValue(forKey: ObjectIdentifier(connection))
+            }
+        }
+        connection.start(queue: queue)
+        receive(on: connection)
+    }
+
+    private func receive(on connection: NWConnection) {
+        connection.receiveMessage { [weak self] data, _, _, error in
+            guard let self else { return }
+            if let data {
+                let messages = Self.decode(data)
+                if !messages.isEmpty {
+                    // Keep a decoded OSC bundle together so RGB components can be
+                    // applied as one color update by the main-actor consumer.
+                    DispatchQueue.main.async { [weak self] in self?.onMessages?(messages) }
+                }
+            }
+            if error == nil {
+                self.receive(on: connection)
+            } else {
+                self.connections.removeValue(forKey: ObjectIdentifier(connection))
+                connection.cancel()
+            }
+        }
+    }
+
+    private func report(_ message: String) {
+        DispatchQueue.main.async { [weak self] in self?.onStatusChange?(message) }
+    }
+
+    private static func decode(_ data: Data) -> [IncomingOSCMessage] {
+        if data.starts(with: Data("#bundle\0".utf8)) {
+            guard data.count >= 16 else { return [] }
+            var result: [IncomingOSCMessage] = []
+            var offset = 16
+            while offset + 4 <= data.count {
+                guard let length = readUInt32(data, at: offset), length > 0 else { break }
+                offset += 4
+                let end = offset + Int(length)
+                guard end <= data.count else { break }
+                result += decode(data.subdata(in: offset..<end))
+                offset = end
+            }
+            return result
+        }
+        var offset = 0
+        guard let address = readString(data, offset: &offset), address.hasPrefix("/"),
+              let tags = readString(data, offset: &offset), tags.first == "," else { return [] }
+        var values: [Float] = []
+        var strings: [String] = []
+        for tag in tags.dropFirst() {
+            switch tag {
+            case "f":
+                guard let bits = readUInt32(data, at: offset) else { return [] }
+                values.append(Float(bitPattern: bits))
+                offset += 4
+            case "i":
+                guard let value = readUInt32(data, at: offset) else { return [] }
+                values.append(Float(Int32(bitPattern: value)))
+                offset += 4
+            case "s":
+                guard let value = readString(data, offset: &offset) else { return [] }
+                strings.append(value)
+            default:
+                return []
+            }
+        }
+        return [IncomingOSCMessage(address: address, values: values, strings: strings)]
+    }
+
+    private static func readString(_ data: Data, offset: inout Int) -> String? {
+        guard offset < data.count, let terminator = data[offset...].firstIndex(of: 0) else { return nil }
+        let value = String(data: data[offset..<terminator], encoding: .utf8)
+        offset = (terminator + 4) & ~3
+        return value
+    }
+
+    private static func readUInt32(_ data: Data, at offset: Int) -> UInt32? {
+        guard offset >= 0, offset + 4 <= data.count else { return nil }
+        return data[offset..<(offset + 4)].reduce(UInt32(0)) { ($0 << 8) | UInt32($1) }
+    }
+}

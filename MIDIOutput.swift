@@ -2,24 +2,22 @@ import CoreMIDI
 import Foundation
 import Darwin
 
-/// A full-state MIDI source for TouchDesigner plus a change-only source for MIDI Learn.
+/// Creates independent full-state and change-only MIDI sources for each controller slot.
 final class MIDIOutput {
-    let sourceName = "DualSenseOM MIDI"
-    let learnSourceName = "DualSenseOM MIDI Learn"
+    func sourceName(slot: Int) -> String { "DualSenseOM MIDI \(slot)" }
+    func learnSourceName(slot: Int) -> String { "DualSenseOM MIDI Learn \(slot)" }
     private var client = MIDIClientRef()
-    private var source = MIDIEndpointRef()
-    private var learnSource = MIDIEndpointRef()
-    private(set) var isAvailable = false
-    private(set) var initializationError: OSStatus?
-    private(set) var isLearnAvailable = false
-    private(set) var learnInitializationError: OSStatus?
+    private var sources: [Int: MIDIEndpointRef] = [:]
+    private var learnSources: [Int: MIDIEndpointRef] = [:]
+    private(set) var initializationErrors: [Int: OSStatus] = [:]
+    private(set) var learnInitializationErrors: [Int: OSStatus] = [:]
     private(set) var lastSendSucceeded = false
     private(set) var sentFrames = 0
     private(set) var sentLearnUpdates = 0
-    private var hasSentState = false
-    private var hasSentMotion = false
-    private var smoothedValues: [UInt8: Float] = [:]
-    private var lastLearnValues: [UInt8: UInt8] = [:]
+    private var sentStateChannels: Set<UInt8> = []
+    private var sentMotionChannels: Set<UInt8> = []
+    private var smoothedValues: [Int: Float] = [:]
+    private var lastLearnValues: [Int: UInt8] = [:]
 
     private let continuousMappings: [(path: String, cc: UInt8, minimum: Float, maximum: Float)] = [
         ("lx", 16, -1, 1), ("ly", 17, -1, 1),
@@ -31,7 +29,6 @@ final class MIDIOutput {
         ("gyro/x", 29, -8, 8), ("gyro/y", 30, -8, 8), ("gyro/z", 31, -8, 8)
     ]
 
-    /// Button and touch states use CC only, so each control has exactly one channel.
     private let buttonControllers: [(path: String, cc: UInt8)] = [
         ("cross", 32), ("circle", 33), ("square", 34), ("triangle", 35),
         ("l1", 36), ("r1", 37), ("options", 38), ("menu", 39),
@@ -44,172 +41,153 @@ final class MIDIOutput {
         var createdClient = MIDIClientRef()
         let clientStatus = MIDIClientCreateWithBlock("DualSenseOM MIDI" as CFString, &createdClient, nil)
         guard clientStatus == noErr else {
-            initializationError = clientStatus
+            initializationErrors[1] = clientStatus
+            initializationErrors[2] = clientStatus
+            learnInitializationErrors[1] = clientStatus
+            learnInitializationErrors[2] = clientStatus
             return
         }
         client = createdClient
-        var createdSource = MIDIEndpointRef()
-        let sourceStatus = MIDISourceCreateWithProtocol(client, sourceName as CFString, MIDIProtocolID(rawValue: 1)!, &createdSource)
-        guard sourceStatus == noErr else {
-            initializationError = sourceStatus
-            return
-        }
-        source = createdSource
-        isAvailable = true
 
-        var createdLearnSource = MIDIEndpointRef()
-        let learnStatus = MIDISourceCreateWithProtocol(client, learnSourceName as CFString, MIDIProtocolID(rawValue: 1)!, &createdLearnSource)
-        guard learnStatus == noErr else {
-            learnInitializationError = learnStatus
-            return
+        for slot in 1...2 {
+            var source = MIDIEndpointRef()
+            let sourceStatus = MIDISourceCreateWithProtocol(client, sourceName(slot: slot) as CFString, MIDIProtocolID(rawValue: 1)!, &source)
+            if sourceStatus == noErr { sources[slot] = source }
+            else { initializationErrors[slot] = sourceStatus }
+
+            var learnSource = MIDIEndpointRef()
+            let learnStatus = MIDISourceCreateWithProtocol(client, learnSourceName(slot: slot) as CFString, MIDIProtocolID(rawValue: 1)!, &learnSource)
+            if learnStatus == noErr { learnSources[slot] = learnSource }
+            else { learnInitializationErrors[slot] = learnStatus }
         }
-        learnSource = createdLearnSource
-        isLearnAvailable = true
     }
 
     deinit {
-        sendNeutral()
-        if learnSource != 0 { MIDIEndpointDispose(learnSource) }
-        if source != 0 { MIDIEndpointDispose(source) }
+        for channel in Array(sentStateChannels) { sendNeutral(channel: channel) }
+        learnSources.values.forEach { MIDIEndpointDispose($0) }
+        sources.values.forEach { MIDIEndpointDispose($0) }
         if client != 0 { MIDIClientDispose(client) }
     }
 
+    func isAvailable(slot: Int) -> Bool { sources[slot] != nil }
+    func isLearnAvailable(slot: Int) -> Bool { learnSources[slot] != nil }
+
     @discardableResult
-    func send(frame: [String: Float], includeMotion: Bool = true) -> Bool {
-        guard isAvailable else {
+    func send(frame: [String: Float], includeMotion: Bool = true, channel: UInt8) -> Bool {
+        guard let source = sources[Int(channel)], (1...16).contains(channel) else {
             lastSendSucceeded = false
             return false
         }
         var words: [UInt32] = []
         var frameCCValues: [(UInt8, UInt8)] = []
         func addCC(_ value: UInt8, number: UInt8) {
-            appendCC(value, number: number, to: &words)
+            appendCC(value, number: number, channel: channel, to: &words)
             frameCCValues.append((number, value))
         }
+
         for mapping in continuousMappings {
             let isMotion = mapping.path.hasPrefix("acc/") || mapping.path.hasPrefix("gyro/")
             guard includeMotion || !isMotion else { continue }
             guard let value = frame["c/\(mapping.path)"] else { continue }
             let isTouchCoordinate = mapping.path == "t1/x" || mapping.path == "t1/y" || mapping.path == "t2/x" || mapping.path == "t2/y"
             let touchPath = mapping.path.hasPrefix("t1/") ? "t1/touch" : "t2/touch"
-            // A released touch point must return to MIDI zero, not the bipolar midpoint (64).
             let touchReleased = isTouchCoordinate && (frame["c/\(touchPath)"] ?? 0) < 0.5
             if touchReleased {
-                smoothedValues[mapping.cc] = 0
+                smoothedValues[cacheKey(channel: channel, cc: mapping.cc)] = 0
                 addCC(0, number: mapping.cc)
                 continue
             }
-            let effectiveValue = value
-            let bounded = min(max(effectiveValue, mapping.minimum), mapping.maximum)
-            let filtered = smoothedValues[mapping.cc].map { $0 + (bounded - $0) * 0.45 } ?? bounded
-            smoothedValues[mapping.cc] = filtered
+            let bounded = min(max(value, mapping.minimum), mapping.maximum)
+            let key = cacheKey(channel: channel, cc: mapping.cc)
+            let filtered = smoothedValues[key].map { $0 + (bounded - $0) * 0.45 } ?? bounded
+            smoothedValues[key] = filtered
             let normalized = (filtered - mapping.minimum) / (mapping.maximum - mapping.minimum)
-            let midiValue = UInt8((normalized * 127).rounded())
-            addCC(midiValue, number: mapping.cc)
+            addCC(UInt8((normalized * 127).rounded()), number: mapping.cc)
         }
+
         for mapping in buttonControllers {
             let isDown = (frame["c/\(mapping.path)"] ?? 0) >= 0.5
-            let value: UInt8 = isDown ? 127 : 0
-            addCC(value, number: mapping.cc)
+            addCC(isDown ? 127 : 0, number: mapping.cc)
         }
-        let succeeded = send(words: words)
+
+        let succeeded = transmit(words: words, from: source)
         lastSendSucceeded = succeeded
         if succeeded {
+            sentStateChannels.insert(channel)
             sentFrames += 1
-            if includeMotion { hasSentMotion = true }
-            sendLearnChanges(frameCCValues)
+            if includeMotion { sentMotionChannels.insert(channel) }
         }
+        sendLearnChanges(frameCCValues, channel: channel)
         return succeeded
     }
 
-    /// Restart analog smoothing after enabling output or reconnecting.
-    func resetStateCache() {
-        smoothedValues.removeAll(keepingCapacity: true)
+    func resetStateCache(channel: UInt8) {
+        smoothedValues = smoothedValues.filter { $0.key / 128 != Int(channel) }
+        lastLearnValues = lastLearnValues.filter { $0.key / 128 != Int(channel) }
     }
 
-    func resetMotionStateCache() {
+    func resetMotionStateCache(channel: UInt8) {
         for cc in UInt8(26)...UInt8(31) {
-            smoothedValues.removeValue(forKey: cc)
+            smoothedValues.removeValue(forKey: cacheKey(channel: channel, cc: cc))
         }
     }
 
-    /// Centers motion CCs when motion output is switched off, so receivers
-    /// don't retain the last tilt/rotation value.
-    func sendMotionNeutral() {
-        guard isAvailable, hasSentState, hasSentMotion else { return }
+    func sendMotionNeutral(channel: UInt8) {
+        guard let source = sources[Int(channel)], sentStateChannels.contains(channel), sentMotionChannels.contains(channel) else { return }
         let motionMappings = continuousMappings.filter {
             $0.path.hasPrefix("acc/") || $0.path.hasPrefix("gyro/")
         }
-        let words = motionMappings.map {
-            Self.word(status: 0xB0, data1: $0.cc, data2: 64)
-        }
-        lastSendSucceeded = send(words: words)
+        let values = motionMappings.map { ($0.cc, UInt8(64)) }
+        let words = values.map { Self.word(channel: channel, data1: $0.0, data2: $0.1) }
+        lastSendSucceeded = transmit(words: words, from: source)
         if lastSendSucceeded {
-            hasSentMotion = false
-            sendLearnChanges(motionMappings.map { ($0.cc, UInt8(64)) })
+            sendLearnChanges(values, channel: channel)
+            sentMotionChannels.remove(channel)
         }
-        for mapping in motionMappings { smoothedValues.removeValue(forKey: mapping.cc) }
+        for mapping in motionMappings {
+            smoothedValues.removeValue(forKey: cacheKey(channel: channel, cc: mapping.cc))
+        }
     }
 
-    /// Returns all mapped CCs to neutral values when output is disabled or disconnected.
-    func sendNeutral() {
-        guard isAvailable, hasSentState else { return }
-        var words: [UInt32] = []
-        var neutralLearnValues: [(UInt8, UInt8)] = []
+    func sendNeutral(channel: UInt8) {
+        guard let source = sources[Int(channel)], sentStateChannels.contains(channel) else { return }
+        var values: [(UInt8, UInt8)] = []
         for mapping in continuousMappings {
             let isMotion = mapping.path.hasPrefix("acc/") || mapping.path.hasPrefix("gyro/")
-            if isMotion && !hasSentMotion { continue }
-            // Stick and motion axes use the MIDI 7-bit midpoint (64) for zero;
-            // triggers and released touch coordinates use 0.
+            if isMotion && !sentMotionChannels.contains(channel) { continue }
             let neutral: UInt8 = mapping.path == "t1/x" || mapping.path == "t1/y" || mapping.path == "t2/x" || mapping.path == "t2/y"
                 ? 0
                 : ((mapping.minimum < 0 && mapping.maximum > 0) ? 64 : 0)
-            words.append(Self.word(status: 0xB0, data1: mapping.cc, data2: neutral))
-            neutralLearnValues.append((mapping.cc, neutral))
+            values.append((mapping.cc, neutral))
         }
-        for mapping in buttonControllers {
-            words.append(Self.word(status: 0xB0, data1: mapping.cc, data2: 0))
-            neutralLearnValues.append((mapping.cc, 0))
+        values.append(contentsOf: buttonControllers.map { ($0.cc, UInt8(0)) })
+        let words = values.map { Self.word(channel: channel, data1: $0.0, data2: $0.1) }
+        if transmit(words: words, from: source) {
+            sendLearnChanges(values, channel: channel)
         }
-        let succeeded = send(words: words)
-        if succeeded {
-            sendLearnChanges(neutralLearnValues)
-            hasSentMotion = false
-        }
-        hasSentState = false
-        smoothedValues.removeAll()
+        sentStateChannels.remove(channel)
+        sentMotionChannels.remove(channel)
+        resetStateCache(channel: channel)
     }
 
-    /// TouchDesigner MIDI In CHOPs may evaluate received MIDI events per frame.
-    /// Emit every mapped CC in every controller sample so unchanged controls
-    /// remain present when another control moves.
-    private func appendCC(_ value: UInt8, number: UInt8, to words: inout [UInt32]) {
-        words.append(Self.word(status: 0xB0, data1: number, data2: value))
-    }
-
-    @discardableResult
-    private func send(words: [UInt32]) -> Bool {
-        guard isAvailable else { return false }
-        let succeeded = transmit(words: words, from: source)
-        if succeeded { hasSentState = true }
-        return succeeded
-    }
-
-    private func sendLearnChanges(_ values: [(UInt8, UInt8)]) {
-        guard isLearnAvailable else { return }
+    private func sendLearnChanges(_ values: [(UInt8, UInt8)], channel: UInt8) {
+        guard let learnSource = learnSources[Int(channel)] else { return }
         var words: [UInt32] = []
         var changedValues: [(UInt8, UInt8)] = []
         for (cc, value) in values {
-            let previous = lastLearnValues[cc] ?? Self.neutralValue(for: cc)
+            let key = cacheKey(channel: channel, cc: cc)
+            let previous = lastLearnValues[key] ?? Self.neutralValue(for: cc)
             guard previous != value else {
-                lastLearnValues[cc] = previous
+                lastLearnValues[key] = previous
                 continue
             }
-            words.append(Self.word(status: 0xB0, data1: cc, data2: value))
+            words.append(Self.word(channel: channel, data1: cc, data2: value))
             changedValues.append((cc, value))
         }
         guard !words.isEmpty, transmit(words: words, from: learnSource) else { return }
-        for (cc, value) in changedValues { lastLearnValues[cc] = value }
+        for (cc, value) in changedValues {
+            lastLearnValues[cacheKey(channel: channel, cc: cc)] = value
+        }
         sentLearnUpdates += 1
     }
 
@@ -230,6 +208,14 @@ final class MIDIOutput {
         return MIDIReceivedEventList(endpoint, UnsafePointer(list)) == noErr
     }
 
+    private func appendCC(_ value: UInt8, number: UInt8, channel: UInt8, to words: inout [UInt32]) {
+        words.append(Self.word(channel: channel, data1: number, data2: value))
+    }
+
+    private func cacheKey(channel: UInt8, cc: UInt8) -> Int {
+        Int(channel) * 128 + Int(cc)
+    }
+
     private static func neutralValue(for cc: UInt8) -> UInt8 {
         switch cc {
         case 16...19, 26...31: return 64
@@ -237,7 +223,8 @@ final class MIDIOutput {
         }
     }
 
-    private static func word(status: UInt8, data1: UInt8, data2: UInt8) -> UInt32 {
-        0x2000_0000 | (UInt32(status) << 16) | (UInt32(data1) << 8) | UInt32(data2)
+    private static func word(channel: UInt8, data1: UInt8, data2: UInt8) -> UInt32 {
+        let status = UInt8(0xB0 | ((channel - 1) & 0x0F))
+        return 0x2000_0000 | (UInt32(status) << 16) | (UInt32(data1) << 8) | UInt32(data2)
     }
 }
